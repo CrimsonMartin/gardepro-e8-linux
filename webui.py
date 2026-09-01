@@ -17,6 +17,7 @@ Usage:
 """
 
 import argparse
+import datetime
 import html
 import json
 import os
@@ -26,11 +27,21 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 HERE = os.path.dirname(os.path.abspath(__file__))
 SIDECAR_SUFFIX = ".wildlife.json"
 ANNOTATED_SUBDIR = "annotated"
+THUMBS_SUBDIR = ".thumbs"
 
 # Real identifications first, taxonomic rollups after, background noise last.
 GENERIC = ["cat family", "canis species", "felis species", "bos species",
            "carnivorous mammal", "mammal", "animal"]
 LAST = ["human", "vehicle", "unidentified", "nothing detected", "not scanned"]
+
+# (key, label, hours back); None = no cutoff. "24h" is the default view.
+BRACKETS = [
+    ("24h", "past 24 hours", 24),
+    ("48h", "past 48 hours", 48),
+    ("7d", "past 7 days", 7 * 24),
+    ("30d", "past 30 days", 30 * 24),
+    ("all", "all time", None),
+]
 
 
 def _load_env(path=None):
@@ -57,14 +68,28 @@ def parse_date(name):
     return f"{d[:4]}-{d[4:6]}-{d[6:]} {t[:2]}:{t[2:4]}:{t[4:]}"
 
 
-def collect(mdir):
-    """Return {label: [clip, ...]} from the sidecars, clips newest first."""
+def collect(mdir, cutoff=None):
+    """Return {label: [clip, ...]} from the sidecars, clips newest first.
+
+    With a cutoff datetime, only clips stamped after it are included; clips
+    with no parseable timestamp only show up in the all-time view.
+    """
     groups = {}
     for name in sorted(os.listdir(mdir), reverse=True):
         if not name.lower().endswith((".mp4", ".jpg", ".jpeg")):
             continue
+        date = parse_date(name)
+        if cutoff is not None:
+            if not date:
+                continue
+            try:
+                stamp = datetime.datetime.strptime(date, "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                continue
+            if stamp < cutoff:
+                continue
         sc = os.path.join(mdir, name + SIDECAR_SUFFIX)
-        clip = {"name": name, "date": parse_date(name),
+        clip = {"name": name, "date": date,
                 "video": name.lower().endswith(".mp4"), "scores": {}}
         if not os.path.exists(sc):
             groups.setdefault("not scanned", []).append(clip)
@@ -128,6 +153,12 @@ PAGE = """<!doctype html>
   .size {{ margin-left: auto; display: flex; align-items: center; gap: 6px;
           color: #7d8a9a; font-size: 12px; }}
   .size input {{ width: 140px; accent-color: #40916c; }}
+  nav select {{ background: #222933; color: #dfe5ec; border: 1px solid #2e3947;
+               border-radius: 16px; padding: 4px 10px; font: inherit; }}
+  #playall {{ background: #2d6a4f; color: #dfe5ec; border: 1px solid #40916c;
+             border-radius: 16px; padding: 4px 12px; font: inherit;
+             cursor: pointer; }}
+  .card video.playing {{ outline: 2px solid #74c69d; }}
   .card {{ background: #1b2027; border: 1px solid #232a33; border-radius: 10px;
           overflow: hidden; }}
   .card video, .card img.still {{ width: 100%; aspect-ratio: 16/9;
@@ -140,7 +171,7 @@ PAGE = """<!doctype html>
   .empty {{ color: #7d8a9a; padding: 40px 0; text-align: center; }}
 </style></head><body>
 <header><h1>gardecam wildlife<small>{total} clips</small></h1></header>
-<nav>{nav}<span class="size">size
+<nav><button id="playall">&#9654; play all</button>{picker}{nav}<span class="size">size
 <input type="range" id="thumb" min="160" max="640" step="20" value="300">
 </span></nav>
 <main>{body}</main>
@@ -154,25 +185,70 @@ PAGE = """<!doctype html>
     apply(slider.value);
     try {{ localStorage.setItem("thumb", slider.value); }} catch (e) {{}}
   }});
+
+  // Play every clip on the page (current group + timeframe) back to back.
+  const btn = document.getElementById("playall");
+  let queue = [], qi = -1;
+  const stopAll = () => {{
+    queue.forEach(v => {{ v.pause(); v.onended = null;
+                          v.classList.remove("playing"); }});
+    qi = -1;
+    btn.innerHTML = "&#9654; play all";
+  }};
+  const playNext = () => {{
+    if (qi >= 0) queue[qi].classList.remove("playing");
+    qi++;
+    if (qi >= queue.length) {{ stopAll(); return; }}
+    const v = queue[qi];
+    v.classList.add("playing");
+    v.scrollIntoView({{ behavior: "smooth", block: "center" }});
+    v.onended = playNext;
+    v.play().catch(playNext);
+  }};
+  btn.addEventListener("click", () => {{
+    if (qi >= 0) {{ stopAll(); return; }}
+    queue = [...document.querySelectorAll("video")];
+    if (!queue.length) return;
+    btn.innerHTML = "&#9632; stop";
+    playNext();
+  }});
 </script>
 </body></html>"""
 
 
-def render(mdir, selected):
-    groups = collect(mdir)
+def render(mdir, selected, bracket):
+    from urllib.parse import quote
+
+    keys = [k for k, _, _ in BRACKETS]
+    if bracket not in keys:
+        bracket = keys[0]
+    hours = next(h for k, _, h in BRACKETS if k == bracket)
+    cutoff = None
+    if hours is not None:
+        cutoff = datetime.datetime.now() - datetime.timedelta(hours=hours)
+
+    groups = collect(mdir, cutoff)
     order = group_order(groups)
     if selected not in groups:
         selected = order[0] if order else ""
-    from urllib.parse import quote
+    picker = ('<select onchange="location=\'/?g=' + quote(selected)
+              + '&t=\'+this.value">'
+              + "".join(f'<option value="{k}"'
+                        f'{" selected" if k == bracket else ""}>'
+                        f'{html.escape(lbl)}</option>'
+                        for k, lbl, _ in BRACKETS)
+              + "</select>")
     nav = "".join(
-        f'<a href="/?g={quote(label)}"'
+        f'<a href="/?g={quote(label)}&t={bracket}"'
         f'{" class=active" if label == selected else ""}>'
         f'{html.escape(label)}<span class="n">{len(groups[label])}</span></a>'
         for label in order)
     cards = []
     for c in groups.get(selected, []):
         src = f"/media/{c['name']}"
-        poster = f"/media/{c['poster']}" if c.get("poster") else ""
+        # Detection frame if there is one, else a generated first-frame thumb.
+        poster = (f"/media/{c['poster']}" if c.get("poster")
+                  else f"/thumb/{quote(c['name'])}" if c["video"] else "")
         if c["video"]:
             media = (f'<video controls preload="none"'
                      f'{f" poster={chr(34)}{poster}{chr(34)}" if poster else ""}'
@@ -190,16 +266,48 @@ def render(mdir, selected):
             f'<span class="date">{c["date"] or html.escape(c["name"])}</span>'
             f'{conf}</div>{others}</div>')
     body = (f'<div class="grid">{"".join(cards)}</div>' if cards
-            else '<div class="empty">no clips in this group</div>')
-    total = sum(1 for n in os.listdir(mdir)
-                if n.lower().endswith((".mp4", ".jpg", ".jpeg")))
-    return PAGE.format(total=total, nav=nav, body=body)
+            else '<div class="empty">no clips in this group and time range</div>')
+    total = sum(len(v) for v in groups.values())
+    return PAGE.format(total=total, picker=picker, nav=nav, body=body)
 
 
 class Handler(SimpleHTTPRequestHandler):
     mdir = None
 
+    def thumb(self, name):
+        """Serve a cached first-frame thumbnail, generating it with ffmpeg."""
+        import shutil as _sh
+        import subprocess as _sp
+        from urllib.parse import unquote
+        name = os.path.normpath(unquote(name)).lstrip("/")
+        src = os.path.join(self.mdir, name)
+        if "/" in name or not os.path.isfile(src):
+            self.send_error(404)
+            return
+        tdir = os.path.join(self.mdir, THUMBS_SUBDIR)
+        out = os.path.join(tdir, name + ".jpg")
+        if not os.path.exists(out):
+            if not _sh.which("ffmpeg"):
+                self.send_error(404)
+                return
+            os.makedirs(tdir, exist_ok=True)
+            r = _sp.run(["ffmpeg", "-v", "error", "-ss", "1", "-i", src,
+                         "-frames:v", "1", "-vf", "scale=640:-1", "-y", out],
+                        capture_output=True)
+            if r.returncode or not os.path.exists(out):
+                # Very short clip: retry from the first frame.
+                r = _sp.run(["ffmpeg", "-v", "error", "-i", src, "-frames:v",
+                             "1", "-vf", "scale=640:-1", "-y", out],
+                            capture_output=True)
+            if not os.path.isfile(out):
+                self.send_error(404)
+                return
+        self.serve_file(out)
+
     def do_GET(self):
+        if self.path.startswith("/thumb/"):
+            self.thumb(self.path[len("/thumb/"):])
+            return
         if self.path.startswith("/media/"):
             # Serve media files (with Range support for video scrubbing is
             # not in stdlib; browsers cope with full-file responses).
@@ -214,7 +322,8 @@ class Handler(SimpleHTTPRequestHandler):
         from urllib.parse import parse_qs, urlparse
         q = parse_qs(urlparse(self.path).query)
         selected = q.get("g", [""])[0]
-        page = render(self.mdir, selected).encode()
+        bracket = q.get("t", [""])[0]
+        page = render(self.mdir, selected, bracket).encode()
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(page)))
