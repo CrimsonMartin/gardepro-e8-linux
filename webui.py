@@ -124,7 +124,10 @@ PAGE = """<!doctype html>
   nav a .n {{ color: #8fa3b8; margin-left: 5px; font-size: 12px; }}
   main {{ padding: 16px 20px 40px; }}
   .grid {{ display: grid; gap: 14px;
-          grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); }}
+          grid-template-columns: repeat(auto-fill, minmax(var(--thumb, 300px), 1fr)); }}
+  .size {{ margin-left: auto; display: flex; align-items: center; gap: 6px;
+          color: #7d8a9a; font-size: 12px; }}
+  .size input {{ width: 140px; accent-color: #40916c; }}
   .card {{ background: #1b2027; border: 1px solid #232a33; border-radius: 10px;
           overflow: hidden; }}
   .card video, .card img.still {{ width: 100%; aspect-ratio: 16/9;
@@ -137,8 +140,21 @@ PAGE = """<!doctype html>
   .empty {{ color: #7d8a9a; padding: 40px 0; text-align: center; }}
 </style></head><body>
 <header><h1>gardecam wildlife<small>{total} clips</small></h1></header>
-<nav>{nav}</nav>
+<nav>{nav}<span class="size">size
+<input type="range" id="thumb" min="160" max="640" step="20" value="300">
+</span></nav>
 <main>{body}</main>
+<script>
+  const slider = document.getElementById("thumb");
+  const apply = v => document.documentElement.style.setProperty("--thumb", v + "px");
+  let saved = null;
+  try {{ saved = localStorage.getItem("thumb"); }} catch (e) {{}}
+  if (saved) {{ slider.value = saved; apply(saved); }}
+  slider.addEventListener("input", () => {{
+    apply(slider.value);
+    try {{ localStorage.setItem("thumb", slider.value); }} catch (e) {{}}
+  }});
+</script>
 </body></html>"""
 
 
@@ -147,8 +163,9 @@ def render(mdir, selected):
     order = group_order(groups)
     if selected not in groups:
         selected = order[0] if order else ""
+    from urllib.parse import quote
     nav = "".join(
-        f'<a href="/?g={html.escape(label, quote=True)}"'
+        f'<a href="/?g={quote(label)}"'
         f'{" class=active" if label == selected else ""}>'
         f'{html.escape(label)}<span class="n">{len(groups[label])}</span></a>'
         for label in order)

@@ -28,6 +28,8 @@ Usage:
   --score S      minimum ensemble score to count a frame (default 0.3)
   --country CC   3-letter country code for SpeciesNet geofencing, e.g. USA
                  (default: $GARDECAM_COUNTRY; improves species rollups)
+  --all          also record humans and vehicles (ignored by default -
+                 only wildlife is reported)
   --remote       run the scan on $GARDECAM_REMOTE over ssh instead: rsync the
                  media there, run this script on that machine (using its GPU
                  if it has one), and rsync the sidecars + annotated frames back
@@ -115,13 +117,17 @@ def extract_frames(src, outdir, stride):
     return paths
 
 
-def draw(frame_path, detections, text):
+def draw(frame_path, detections, label, text):
     img = cv2.imread(str(frame_path))
     if img is None:
         return None
     h, w = img.shape[:2]
+    # MegaDetector boxes animals, humans, AND vehicles, but the species
+    # caption applies to the whole frame - so only draw the boxes of the
+    # kind being labeled, or parked cars end up boxed under a "cat" caption.
+    wanted = label if label in ("human", "vehicle") else "animal"
     for d in detections or []:
-        if d.get("conf", 0) < 0.2:
+        if d.get("label") != wanted or d.get("conf", 0) < 0.2:
             continue
         x, y, bw, bh = d.get("bbox", [0, 0, 0, 0])
         p1 = (int(x * w), int(y * h))
@@ -158,6 +164,8 @@ for name in cfg["files"]:
             label = label_of(pred)
             if label in ("blank", "no cv result") or score < cfg["score"]:
                 continue
+            if label in ("human", "vehicle") and not cfg.get("all"):
+                continue
             s = stats.setdefault(label, {"frames": 0, "max_score": 0.0,
                                          "prediction": pred})
             s["frames"] += 1
@@ -174,7 +182,7 @@ for name in cfg["files"]:
 
         for label in present:
             score, fpath, dets = best[label]
-            img = draw(fpath, dets, f"{label} {score:.2f}")
+            img = draw(fpath, dets, label, f"{label} {score:.2f}")
             if img is not None:
                 annotated.mkdir(exist_ok=True)
                 safe = label.replace(" ", "_").replace("/", "_")
@@ -316,6 +324,8 @@ def run_remote(args, mdir):
            f" --stride {args.stride} --score {args.score}")
     if args.country:
         cmd += f" --country {args.country}"
+    if args.all:
+        cmd += " --all"
     if args.force:
         cmd += " --force"
     if args.limit:
@@ -344,6 +354,7 @@ def main():
     ap.add_argument("--stride", type=int, default=5)
     ap.add_argument("--score", type=float, default=0.3)
     ap.add_argument("--country", default=os.environ.get("GARDECAM_COUNTRY", ""))
+    ap.add_argument("--all", action="store_true")
     ap.add_argument("--remote", action="store_true")
     ap.add_argument("--report", action="store_true")
     args = ap.parse_args()
@@ -381,6 +392,7 @@ def main():
                 "stride": args.stride,
                 "score": args.score,
                 "country": args.country or None,
+                "all": args.all,
                 "engine": ENGINE,
                 "sidecar_suffix": SIDECAR_SUFFIX,
                 "annotated_subdir": ANNOTATED_SUBDIR,
