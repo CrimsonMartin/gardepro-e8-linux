@@ -158,7 +158,14 @@ PAGE = """<!doctype html>
   #playall {{ background: #2d6a4f; color: #dfe5ec; border: 1px solid #40916c;
              border-radius: 16px; padding: 4px 12px; font: inherit;
              cursor: pointer; }}
-  .card video.playing {{ outline: 2px solid #74c69d; }}
+  #theater {{ position: fixed; inset: 0; background: #000; z-index: 10; }}
+  #theater video {{ width: 100%; height: 100%; object-fit: contain; }}
+  #tinfo {{ position: absolute; top: 12px; left: 16px; color: #dfe5ec;
+           background: rgba(0,0,0,.55); padding: 6px 12px; border-radius: 8px;
+           font-size: 14px; pointer-events: none; }}
+  #tclose {{ position: absolute; top: 12px; right: 16px; color: #dfe5ec;
+            background: rgba(0,0,0,.55); border: 0; border-radius: 8px;
+            padding: 6px 12px; font: inherit; cursor: pointer; }}
   .card {{ background: #1b2027; border: 1px solid #232a33; border-radius: 10px;
           overflow: hidden; }}
   .card video, .card img.still {{ width: 100%; aspect-ratio: 16/9;
@@ -175,6 +182,11 @@ PAGE = """<!doctype html>
 <input type="range" id="thumb" min="160" max="640" step="20" value="300">
 </span></nav>
 <main>{body}</main>
+<div id="theater" hidden>
+  <video id="tvid" controls></video>
+  <div id="tinfo"></div>
+  <button id="tclose">&#10005; close</button>
+</div>
 <script>
   const slider = document.getElementById("thumb");
   const apply = v => document.documentElement.style.setProperty("--thumb", v + "px");
@@ -186,31 +198,46 @@ PAGE = """<!doctype html>
     try {{ localStorage.setItem("thumb", slider.value); }} catch (e) {{}}
   }});
 
-  // Play every clip on the page (current group + timeframe) back to back.
+  // Play all clips from the current group + timeframe back to back in a
+  // fullscreen player, oldest to newest, like a VLC playlist.
   const btn = document.getElementById("playall");
-  let queue = [], qi = -1;
-  const stopAll = () => {{
-    queue.forEach(v => {{ v.pause(); v.onended = null;
-                          v.classList.remove("playing"); }});
-    qi = -1;
-    btn.innerHTML = "&#9654; play all";
+  const theater = document.getElementById("theater");
+  const tvid = document.getElementById("tvid");
+  const tinfo = document.getElementById("tinfo");
+  let playlist = [], pi = -1;
+  const closeTheater = () => {{
+    tvid.pause();
+    tvid.removeAttribute("src");
+    theater.hidden = true;
+    pi = -1;
+    if (document.fullscreenElement) document.exitFullscreen().catch(() => {{}});
   }};
   const playNext = () => {{
-    if (qi >= 0) queue[qi].classList.remove("playing");
-    qi++;
-    if (qi >= queue.length) {{ stopAll(); return; }}
-    const v = queue[qi];
-    v.classList.add("playing");
-    v.scrollIntoView({{ behavior: "smooth", block: "center" }});
-    v.onended = playNext;
-    v.play().catch(playNext);
+    pi++;
+    if (pi >= playlist.length) {{ closeTheater(); return; }}
+    const c = playlist[pi];
+    tinfo.textContent =
+      `${{pi + 1}}/${{playlist.length}}  ${{c.date || c.name}}`;
+    tvid.src = c.src;
+    tvid.play().catch(playNext);
   }};
   btn.addEventListener("click", () => {{
-    if (qi >= 0) {{ stopAll(); return; }}
-    queue = [...document.querySelectorAll("video")];
-    if (!queue.length) return;
-    btn.innerHTML = "&#9632; stop";
+    playlist = [...document.querySelectorAll(".card video")]
+      .map(v => ({{ src: v.src, name: v.dataset.name, date: v.dataset.date }}))
+      .sort((a, b) => a.name.localeCompare(b.name));  // ids grow with time
+    if (!playlist.length) return;
+    pi = -1;
+    theater.hidden = false;
+    theater.requestFullscreen().catch(() => {{}});
     playNext();
+  }});
+  tvid.addEventListener("ended", playNext);
+  document.getElementById("tclose").addEventListener("click", closeTheater);
+  document.addEventListener("fullscreenchange", () => {{
+    if (!document.fullscreenElement && !theater.hidden) closeTheater();
+  }});
+  document.addEventListener("keydown", e => {{
+    if (e.key === "Escape" && !theater.hidden) closeTheater();
   }});
 </script>
 </body></html>"""
@@ -251,6 +278,8 @@ def render(mdir, selected, bracket):
                   else f"/thumb/{quote(c['name'])}" if c["video"] else "")
         if c["video"]:
             media = (f'<video controls preload="none"'
+                     f' data-name="{html.escape(c["name"], quote=True)}"'
+                     f' data-date="{c["date"]}"'
                      f'{f" poster={chr(34)}{poster}{chr(34)}" if poster else ""}'
                      f' src="{src}"></video>')
         else:
