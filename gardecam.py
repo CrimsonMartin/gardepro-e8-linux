@@ -286,10 +286,35 @@ def list_files(count=500):
     return api(f"/list/detail/JPG/999999/{count}", timeout=30)
 
 
+def list_all_files():
+    """Page through the whole listing; firmware caps each response (~40).
+
+    startId is an exclusive upper bound, so after each batch we ask again
+    below the lowest id we've seen until nothing new comes back.
+    """
+    items, seen, start = [], set(), 999999
+    while True:
+        batch = _entries(api(f"/list/detail/JPG/{start}/500", timeout=30))
+        ids = [it.get("id") for it in batch
+               if isinstance(it, dict) and isinstance(it.get("id"), int)
+               and it.get("id") not in seen]
+        if not ids:
+            break
+        items.extend(it for it in batch
+                     if isinstance(it, dict) and it.get("id") in set(ids))
+        seen.update(ids)
+        start = min(ids)
+    return items
+
+
 def cmd_list(count=20):
     ka = link_up()
     try:
-        items = _entries(list_files(max(count, 50)))[:count]
+        # A single request tops out around 40 entries; paginate past that.
+        if count > 40:
+            items = list_all_files()[:count]
+        else:
+            items = _entries(list_files(max(count, 50)))[:count]
         if not items:
             print("camera reports no media")
             return
@@ -491,11 +516,10 @@ def cmd_get(fid, kind):
 def cmd_sync(outdir=PHOTO_DIR):
     ka = link_up()
     try:
-        listing = list_files(500)
-        items = _entries(listing)
+        items = list_all_files()
         if not items:
             print("no files reported by camera; raw response:")
-            print(json.dumps(listing, indent=2)[:2000])
+            print(json.dumps(list_files(50), indent=2)[:2000])
             return
         total_mb = sum(i.get("size", 0) for i in items) / 1048576
         print(f"camera reports {len(items)} file(s), {total_mb:.1f} MB; syncing to {outdir}")
