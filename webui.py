@@ -303,6 +303,12 @@ def render(mdir, selected, bracket):
 class Handler(SimpleHTTPRequestHandler):
     mdir = None
 
+    def handle(self):
+        try:
+            super().handle()
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # client went away mid-response; nothing to do
+
     def thumb(self, name):
         """Serve a cached first-frame thumbnail, generating it with ffmpeg."""
         import shutil as _sh
@@ -414,7 +420,12 @@ def main():
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
-        pass
+        print("\nshutting down")
+    finally:
+        srv.server_close()
+        # Hard exit: don't let a request thread stuck streaming a video to a
+        # stalled client keep the process (and the terminal) hostage.
+        os._exit(0)
 
 
 if __name__ == "__main__":
