@@ -13,7 +13,8 @@ Usage:
   gardecam.py info                 device, battery, storage
   gardecam.py list [N]             list the N most recent files (default 20)
   gardecam.py get ID JPG|MP4       download one file
-  gardecam.py sync [DIR]           download everything not already local
+  gardecam.py sync [DIR] [JOBS]    download everything not already local
+                                   (JOBS parallel downloads, default 4)
   gardecam.py fix [DIR]            strip preview track from clips already on disk
   gardecam.py setclock [TZ]        sync camera clock + timezone to this machine
   gardecam.py session [SECONDS]    hold the link open (default 300)
@@ -513,7 +514,21 @@ def cmd_get(fid, kind):
         ka.stop()
 
 
-def cmd_sync(outdir=PHOTO_DIR):
+def _sync_one(it, outdir):
+    """Download one listing entry. Returns (fetched, message-or-None)."""
+    kind = "MP4" if it.get("type") == 2 else "JPG"
+    path, fetched = download(it["id"], kind, outdir, it.get("date"))
+    if not fetched:
+        return False, None
+    note = ""
+    if kind == "MP4" and strip_preview_track(path):
+        note = ", preview track stripped"
+    return True, (f"  + {os.path.basename(path)}  "
+                  f"({it.get('size',0)/1048576:.1f} MB{note})")
+
+
+def cmd_sync(outdir=PHOTO_DIR, jobs=4):
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     ka = link_up()
     try:
         items = list_all_files()
@@ -521,29 +536,35 @@ def cmd_sync(outdir=PHOTO_DIR):
             print("no files reported by camera; raw response:")
             print(json.dumps(list_files(50), indent=2)[:2000])
             return
+        items = [it for it in items
+                 if isinstance(it, dict) and it.get("id") is not None]
         total_mb = sum(i.get("size", 0) for i in items) / 1048576
-        print(f"camera reports {len(items)} file(s), {total_mb:.1f} MB; syncing to {outdir}")
-        new = 0
-        for it in items:
-            if not isinstance(it, dict):
-                continue
-            fid = it.get("id")
-            if fid is None:
-                continue
-            kind = "MP4" if it.get("type") == 2 else "JPG"
-            try:
-                path, fetched = download(fid, kind, outdir, it.get("date"))
+        print(f"camera reports {len(items)} file(s), {total_mb:.1f} MB; "
+              f"syncing to {outdir} with {jobs} worker(s)")
+        new, failed = 0, []
+        with ThreadPoolExecutor(max_workers=max(1, jobs)) as pool:
+            futs = {pool.submit(_sync_one, it, outdir): it for it in items}
+            for fut in as_completed(futs):
+                it = futs[fut]
+                try:
+                    fetched, msg = fut.result()
+                except Exception as e:
+                    print(f"  ! file {it['id']} failed: {e} (will retry)")
+                    failed.append(it)
+                    continue
                 if fetched:
                     new += 1
-                    note = ""
-                    if kind == "MP4" and strip_preview_track(path):
-                        note = ", preview track stripped"
-                    print(
-                        f"  + {os.path.basename(path)}  "
-                        f"({it.get('size',0)/1048576:.1f} MB{note})"
-                    )
+                    print(msg)
+        # Whatever failed under concurrency gets one calm serial retry: if
+        # the firmware chokes on parallel connections, this is the fallback.
+        for it in failed:
+            try:
+                fetched, msg = _sync_one(it, outdir)
+                if fetched:
+                    new += 1
+                    print(msg)
             except Exception as e:
-                print(f"  ! file {fid} failed: {e}")
+                print(f"  ! file {it['id']} failed again: {e}")
         print(f"done, {new} new file(s) in {outdir}")
     finally:
         ka.stop()
@@ -581,7 +602,11 @@ def main():
     elif cmd == "get":
         cmd_get(args[1], args[2].upper() if len(args) > 2 else "JPG")
     elif cmd == "sync":
-        cmd_sync(args[1] if len(args) > 1 else PHOTO_DIR)
+        # sync [DIR] [JOBS] in either order; a bare integer means jobs.
+        rest = args[1:]
+        jobs = next((int(a) for a in rest if a.isdigit()), 4)
+        outdir = next((a for a in rest if not a.isdigit()), PHOTO_DIR)
+        cmd_sync(outdir, jobs)
     elif cmd == "fix":
         cmd_fix(args[1] if len(args) > 1 else None)
     elif cmd == "setclock":
