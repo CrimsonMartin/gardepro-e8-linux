@@ -57,6 +57,40 @@ duration.** Every command reconnects you afterwards; `disconnect` does it
 explicitly if something is interrupted. A cheap USB WiFi dongle removes the
 limitation — point the tool at it with `GARDECAM_IFACE=wlan1`.
 
+## Unattended: hourly sync + wildlife alerts on your phone
+
+`autosync.py` chains the whole pipeline for a laptop that sits within Bluetooth
+range of the camera: `sync` → `disconnect` → `wildlife.py --remote` on the GPU
+host → one push notification per new wildlife clip. The remote host's Immich
+watches the `annotated/` folder, so the labelled clips show up there on their
+own; raw clips never reach Immich.
+
+```bash
+cp .env.example .env            # set GARDECAM_REMOTE, GARDECAM_NTFY_URL, GARDECAM_IMMICH_URL
+python3 autosync.py --test-notify        # one sample push with an attachment
+python3 autosync.py --skip-camera        # dry pass: remote scan + notify only
+./install-autosync.sh                    # systemd user units, timer left off
+systemctl --user enable --now gardecam-autosync.timer
+```
+
+The laptop needs `ssh` + `rsync`, an ssh config entry for the remote host (over
+Tailscale works fine), and the usual bluetooth/wifi access for `gardecam.py`.
+Docker is only needed on the remote host. A lock file stops two passes from
+overlapping; if the camera is out of range the pass still runs the remote scan
+for anything already on disk and exits non-zero so the journal shows it.
+
+Notifications go through a self-hosted [ntfy](https://ntfy.sh) server (a
+one-container `docker compose` on the GPU host). On the phone install the ntfy
+app, add the server URL under settings, and subscribe to the topic named in
+`GARDECAM_NTFY_URL` - the topic name is the only secret, so make it long and
+random. iOS needs the server's `upstream-base-url` pointed at `https://ntfy.sh`
+so Apple push can wake the app; the message itself is still fetched from your
+server, so the phone must be able to reach it (Tailscale).
+
+Hourly means the camera is woken over Bluetooth and brings its hotspot up every
+hour, which costs battery: fine on mains or solar, noticeable on AA cells. Change
+`OnCalendar` in `install-autosync.sh` for a gentler cadence.
+
 ## How it works
 
 The camera sleeps with only Bluetooth LE advertising (`CAM8Z8_NoName_G_E8`).
