@@ -5,7 +5,8 @@ autosync - one unattended pass of the whole gardecam pipeline.
   1. gardecam.py sync        pull new clips off the camera (needs BLE range)
   2. gardecam.py disconnect  leave the camera hotspot, back on normal wifi
   3. wildlife.py --remote    push to $GARDECAM_REMOTE, detect, render, pull
-  4. ntfy                    one phone notification per new wildlife clip
+  4. ntfy                    one phone notification per new wildlife clip,
+                             with the annotated video attached
 
 Meant to be fired by a timer (see gardecam-autosync.timer); a lock file keeps
 two passes from touching the camera at once. Immich on the remote host picks
@@ -16,7 +17,8 @@ Usage:
 
   --skip-camera  don't wake the camera; just run the remote scan + notify
                  (useful when the laptop is away from the camera)
-  --test-notify  send one sample notification with an attachment and exit
+  --test-notify  send one sample notification (newest annotated clip
+                 attached) and exit
 
 Settings (from .env or the environment):
   GARDECAM_NTFY_URL   ntfy topic URL, e.g. http://gpu-host:8090/gardecam-<random>
@@ -156,11 +158,20 @@ def notify_new(new):
         primary = max(wild, key=lambda l: scores.get(l, {}).get("frames", 0))
         safe = primary.replace(" ", "_").replace("/", "_")
         stem = os.path.splitext(name)[0]
-        jpg = os.path.join(MEDIA, ANNOTATED_SUBDIR, f"{stem}_{safe}.jpg")
+        # Attach the annotated clip (boxes tracking the animal); stills and
+        # anything without a rendered video fall back to the best frame.
+        attach = None
+        vid = data.get("annotated_video")
+        if vid and os.path.exists(os.path.join(MEDIA, vid)):
+            attach = os.path.join(MEDIA, vid)
+        else:
+            jpg = os.path.join(MEDIA, ANNOTATED_SUBDIR, f"{stem}_{safe}.jpg")
+            if os.path.exists(jpg):
+                attach = jpg
         when = clip_when(name)
         notify(f"gardecam: {primary}",
                f"{desc}\n{name}" + (f"  {when}" if when else ""),
-               attachment=jpg, tags=["paw_prints"])
+               attachment=attach, tags=["paw_prints"])
     rest = items[NOTIFY_MAX:]
     if rest:
         counts = {}
@@ -188,9 +199,12 @@ def main():
         sample = None
         adir = os.path.join(MEDIA, ANNOTATED_SUBDIR)
         if os.path.isdir(adir):
-            jpgs = sorted(f for f in os.listdir(adir) if f.endswith(".jpg"))
-            if jpgs:
-                sample = os.path.join(adir, jpgs[-1])
+            files = sorted(os.listdir(adir), key=lambda f: clip_when(f))
+            vids = [f for f in files if f.endswith(".mp4")]
+            jpgs = [f for f in files if f.endswith(".jpg")]
+            pick = vids[-1] if vids else jpgs[-1] if jpgs else None
+            if pick:
+                sample = os.path.join(adir, pick)
         ok = notify("gardecam: test", "notifications are wired up"
                     + (f"\n{os.path.basename(sample)}" if sample else ""),
                     attachment=sample, tags=["white_check_mark"])
