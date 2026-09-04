@@ -13,7 +13,8 @@ Usage:
   gardecam.py info                 device, battery, storage
   gardecam.py list [N]             list the N most recent files (default 20)
   gardecam.py get ID JPG|MP4       download one file
-  gardecam.py sync [DIR] [JOBS]    download everything not already local
+  gardecam.py sync [DIR] [JOBS]    download everything not already local from
+                                   every camera in GARDECAM_BLE_MAC
                                    (JOBS parallel downloads, default 4)
   gardecam.py fix [DIR]            strip preview track from clips already on disk
   gardecam.py setclock [TZ]        sync camera clock + timezone to this machine
@@ -24,6 +25,7 @@ Usage:
 import asyncio
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -51,14 +53,27 @@ def _load_env(path=None):
 _load_env()
 
 # The camera's Bluetooth MAC identifies a specific camera, so it lives in .env
-# rather than in the source. See .env.example for how to find yours.
-BLE_MAC = os.environ.get("GARDECAM_BLE_MAC", "").strip().upper()
+# rather than in the source. See .env.example for how to find yours. Several
+# cameras can be listed (comma or space separated); `sync` visits each in turn
+# and everything lands in the same media directory, while the other commands
+# talk to the first one listed.
+CAMERAS = [m.upper() for m in
+           re.split(r"[\s,;]+", os.environ.get("GARDECAM_BLE_MAC", "").strip())
+           if m]
+BLE_MAC = CAMERAS[0] if CAMERAS else ""
 NUS_RX = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"
 # Second writable characteristic on the camera's UART service. Writing the wake
 # command here as well as to NUS_RX is what actually brings the hotspot up.
 NUS_ALT = "6e400004-b5a3-f393-e0a9-e50e24dcca9e"
 # The hotspot name is the model prefix plus the MAC with the colons stripped.
 SSID = "CAM8Z8_" + BLE_MAC.replace(":", "")
+
+
+def select_camera(mac):
+    """Point the module-level camera identity at another listed camera."""
+    global BLE_MAC, SSID
+    BLE_MAC = mac
+    SSID = "CAM8Z8_" + mac.replace(":", "")
 WIFI_PASS = os.environ.get("GARDECAM_WIFI_PASS", "1234567890")
 PROFILE = "gardecam"
 BASE = "http://192.168.8.1:8080"
@@ -528,6 +543,31 @@ def _sync_one(it, outdir):
 
 
 def cmd_sync(outdir=PHOTO_DIR, jobs=4):
+    """Sync every configured camera into outdir, one after another.
+
+    A camera that is out of range (or never wakes) is reported and skipped so
+    the rest still get synced; the exit status is non-zero if any failed.
+    """
+    require_mac()
+    failed = []
+    for i, mac in enumerate(CAMERAS, 1):
+        select_camera(mac)
+        if len(CAMERAS) > 1:
+            print(f"--- camera {i}/{len(CAMERAS)}: {mac}")
+        try:
+            _sync_camera(outdir, jobs)
+        except SystemExit as e:
+            print(f"camera {mac}: {e}")
+            failed.append(mac)
+        except Exception as e:
+            print(f"camera {mac}: sync failed: {e}")
+            failed.append(mac)
+    if failed:
+        raise SystemExit(f"{len(failed)} of {len(CAMERAS)} camera(s) failed: "
+                         + ", ".join(failed))
+
+
+def _sync_camera(outdir, jobs):
     from concurrent.futures import ThreadPoolExecutor, as_completed
     ka = link_up()
     try:

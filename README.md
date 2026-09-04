@@ -20,7 +20,7 @@ Use this on cameras you own.
 ## Setup
 
 ```bash
-cp .env.example .env          # then set GARDECAM_BLE_MAC to your camera
+cp .env.example .env          # then set GARDECAM_BLE_MAC to your camera(s)
 pip install bleak
 ```
 
@@ -38,7 +38,7 @@ The hotspot name is derived from the MAC, so that one value is all it needs.
 ```bash
 python3 gardecam.py info        # model, battery, SD usage
 python3 gardecam.py list 20     # newest 20 files
-python3 gardecam.py sync        # download everything new -> ./media
+python3 gardecam.py sync        # download everything new -> ./media (every camera)
 python3 gardecam.py fix         # strip preview track from clips already on disk
 python3 gardecam.py setclock    # sync camera clock + timezone to this machine
 python3 gardecam.py get 1002 MP4
