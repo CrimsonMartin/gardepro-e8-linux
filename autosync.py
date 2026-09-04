@@ -5,8 +5,9 @@ autosync - one unattended pass of the whole gardecam pipeline.
   1. gardecam.py sync        pull new clips off the camera (needs BLE range)
   2. gardecam.py disconnect  leave the camera hotspot, back on normal wifi
   3. wildlife.py --remote    push to $GARDECAM_REMOTE, detect, render, pull
-  4. ntfy                    one phone notification per new wildlife clip,
-                             with the annotated video attached
+  4. ntfy                    one phone notification per new wildlife clip:
+                             best frame attached for the preview, a tap
+                             plays the annotated video
 
 Meant to be fired by a timer (see gardecam-autosync.timer); a lock file keeps
 two passes from touching the camera at once. Immich on the remote host picks
@@ -17,13 +18,17 @@ Usage:
 
   --skip-camera  don't wake the camera; just run the remote scan + notify
                  (useful when the laptop is away from the camera)
-  --test-notify  send one sample notification (newest annotated clip
-                 attached) and exit
+  --test-notify  send one sample notification for the newest annotated clip
+                 and exit
 
 Settings (from .env or the environment):
   GARDECAM_NTFY_URL   ntfy topic URL, e.g. http://gpu-host:8090/gardecam-<random>
                       (unset = no notifications)
-  GARDECAM_IMMICH_URL where a tap on the notification should open
+  GARDECAM_CLIP_URL   base URL where the remote host serves the annotated
+                      folder, e.g. http://gpu-host:8091/annotated/ - a tap on
+                      the notification then plays the clip (unset = tap opens
+                      Immich instead)
+  GARDECAM_IMMICH_URL Immich URL, offered as a button on each notification
   GARDECAM_NOTIFY_MAX max per-clip notifications per pass (default 5); the
                       rest are rolled into one summary message
 """
@@ -36,6 +41,7 @@ import os
 import subprocess
 import sys
 import time
+import urllib.parse
 import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -50,6 +56,7 @@ MEDIA = os.path.abspath(os.environ.get("GARDECAM_MEDIA",
 LOCK = os.path.join(os.path.expanduser("~"), ".cache", "gardecam-autosync.lock")
 NTFY = os.environ.get("GARDECAM_NTFY_URL", "").strip()
 IMMICH = os.environ.get("GARDECAM_IMMICH_URL", "").strip()
+CLIP_URL = os.environ.get("GARDECAM_CLIP_URL", "").strip()
 NOTIFY_MAX = int(os.environ.get("GARDECAM_NOTIFY_MAX", "5"))
 NOT_WILD = ("human", "vehicle")
 
@@ -102,9 +109,12 @@ def wait_for_remote(tries=24, pause=5):
 
 # ------------------------------------------------------------------ ntfy
 
-def notify(title, message, attachment=None, priority=None, tags=None):
+def notify(title, message, attachment=None, priority=None, tags=None,
+           click=None, actions=None):
     """Publish one message to the ntfy topic; True on success.
 
+    click:   URL opened by tapping the notification (default: Immich)
+    actions: [(label, url), ...] shown as buttons on the notification
     When a file is attached the text travels in the Message header, and HTTP
     headers cannot hold newlines, so multi-line messages are flattened.
     """
@@ -113,8 +123,12 @@ def notify(title, message, attachment=None, priority=None, tags=None):
     message = " · ".join(l.strip() for l in message.splitlines() if l.strip())
     headers = {"Title": title.encode("utf-8").decode("latin-1", "replace"),
                "Markdown": "no"}
-    if IMMICH:
-        headers["Click"] = IMMICH
+    click = click or IMMICH
+    if click:
+        headers["Click"] = click
+    if actions:
+        headers["Actions"] = "; ".join(
+            f"view, {label}, {url}" for label, url in actions if url)
     if priority:
         headers["Priority"] = str(priority)
     if tags:
@@ -146,6 +160,18 @@ def clip_when(name):
     return f"{d[:4]}-{d[4:6]}-{d[6:]} {t[:2]}:{t[2:4]}"
 
 
+def clip_link(annotated_video):
+    """(tap URL, action buttons) for a clip: the best frame is what gets
+    attached so the notification previews, and the annotated video sits one
+    tap away on the remote host's clip server."""
+    url = None
+    if annotated_video and CLIP_URL:
+        url = CLIP_URL.rstrip("/") + "/" + urllib.parse.quote(
+            os.path.basename(annotated_video))
+    actions = [("Watch clip", url), ("Immich", IMMICH)]
+    return url, [a for a in actions if a[1]]
+
+
 def notify_new(new):
     """One message per new wildlife clip (with its best frame), then a
     summary if there were more than NOTIFY_MAX."""
@@ -158,20 +184,13 @@ def notify_new(new):
         primary = max(wild, key=lambda l: scores.get(l, {}).get("frames", 0))
         safe = primary.replace(" ", "_").replace("/", "_")
         stem = os.path.splitext(name)[0]
-        # Attach the annotated clip (boxes tracking the animal); stills and
-        # anything without a rendered video fall back to the best frame.
-        attach = None
-        vid = data.get("annotated_video")
-        if vid and os.path.exists(os.path.join(MEDIA, vid)):
-            attach = os.path.join(MEDIA, vid)
-        else:
-            jpg = os.path.join(MEDIA, ANNOTATED_SUBDIR, f"{stem}_{safe}.jpg")
-            if os.path.exists(jpg):
-                attach = jpg
+        jpg = os.path.join(MEDIA, ANNOTATED_SUBDIR, f"{stem}_{safe}.jpg")
         when = clip_when(name)
+        clip, actions = clip_link(data.get("annotated_video"))
         notify(f"gardecam: {primary}",
                f"{desc}\n{name}" + (f"  {when}" if when else ""),
-               attachment=attach, tags=["paw_prints"])
+               attachment=jpg if os.path.exists(jpg) else None,
+               click=clip, actions=actions, tags=["paw_prints"])
     rest = items[NOTIFY_MAX:]
     if rest:
         counts = {}
@@ -196,18 +215,22 @@ def main():
     if args.test_notify:
         if not NTFY:
             raise SystemExit("GARDECAM_NTFY_URL is not set")
-        sample = None
-        adir = os.path.join(MEDIA, ANNOTATED_SUBDIR)
-        if os.path.isdir(adir):
-            files = sorted(os.listdir(adir), key=lambda f: clip_when(f))
-            vids = [f for f in files if f.endswith(".mp4")]
-            jpgs = [f for f in files if f.endswith(".jpg")]
-            pick = vids[-1] if vids else jpgs[-1] if jpgs else None
-            if pick:
-                sample = os.path.join(adir, pick)
+        # Newest clip that has an annotated video: frame attached, tap plays.
+        newest = max(((clip_when(n), n, d) for n, d in wildlife_clips().items()
+                      if d.get("annotated_video")), default=None)
+        sample, clip, actions = None, None, None
+        if newest:
+            _, name, data = newest
+            stem = os.path.splitext(name)[0]
+            vid = os.path.basename(data["annotated_video"])
+            sample = os.path.join(MEDIA, ANNOTATED_SUBDIR,
+                                  os.path.splitext(vid)[0] + ".jpg")
+            clip, actions = clip_link(data["annotated_video"])
         ok = notify("gardecam: test", "notifications are wired up"
-                    + (f"\n{os.path.basename(sample)}" if sample else ""),
-                    attachment=sample, tags=["white_check_mark"])
+                    + (f"\n{name}" if newest else ""),
+                    attachment=sample if sample and os.path.exists(sample)
+                    else None, click=clip, actions=actions,
+                    tags=["white_check_mark"])
         log(f"test notification {'sent to' if ok else 'FAILED for'} {NTFY}")
         raise SystemExit(0 if ok else 1)
 
