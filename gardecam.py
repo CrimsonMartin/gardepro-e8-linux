@@ -330,6 +330,45 @@ def list_all_files():
     return items
 
 
+def _local_keys(outdir):
+    """{'<id>_<stamp>'} for every clip already on disk (any camera prefix)."""
+    keys = set()
+    if not os.path.isdir(outdir):
+        return keys
+    for n in os.listdir(outdir):
+        m = re.match(r"^(?:cam\d+_)?(\d+_\d{8}_\d{6})\.(?:mp4|jpg)$", n, re.I)
+        if m and os.path.getsize(os.path.join(outdir, n)) > 0:
+            keys.add(m.group(1))
+    return keys
+
+
+def _key(it):
+    stamp = str(it.get("date", "")).replace(":", "").replace("-", "").replace(" ", "_")
+    return f"{it.get('id')}_{stamp}"
+
+
+def list_new_files(outdir):
+    """Like list_all_files, but stop paging as soon as a whole page is
+    already on disk. The camera lists newest first, so an unattended sync
+    that finds nothing new costs one request instead of one per ~40 files.
+    """
+    local = _local_keys(outdir)
+    items, seen, start = [], set(), 999999
+    while True:
+        batch = _entries(api(f"/list/detail/JPG/{start}/500", timeout=30))
+        fresh = [it for it in batch
+                 if isinstance(it, dict) and isinstance(it.get("id"), int)
+                 and it.get("id") not in seen]
+        if not fresh:
+            break
+        seen.update(it["id"] for it in fresh)
+        items.extend(fresh)
+        if all(_key(it) in local for it in fresh):
+            break
+        start = min(it["id"] for it in fresh)
+    return items
+
+
 def cmd_list(count=20):
     ka = link_up()
     try:
@@ -584,7 +623,7 @@ def _sync_camera(outdir, jobs):
     from concurrent.futures import ThreadPoolExecutor, as_completed
     ka = link_up()
     try:
-        items = list_all_files()
+        items = list_new_files(outdir)
         if not items:
             print("no files reported by camera; raw response:")
             print(json.dumps(list_files(50), indent=2)[:2000])

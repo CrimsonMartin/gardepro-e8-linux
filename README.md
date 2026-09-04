@@ -60,7 +60,7 @@ duration.** `sync` reconnects you when it finishes; `disconnect` does it
 explicitly if something is interrupted. A cheap USB WiFi dongle removes the
 limitation — point the tool at it with `GARDECAM_IFACE=wlan1`.
 
-## Unattended: hourly sync + wildlife alerts on your phone
+## Unattended: continuous sync + wildlife alerts on your phone
 
 `autosync.py` chains the whole pipeline for a laptop that sits within Bluetooth
 range of the camera: `sync` → `disconnect` → `wildlife.py --remote` on the GPU
@@ -73,6 +73,7 @@ cp .env.example .env            # set GARDECAM_REMOTE, GARDECAM_NTFY_URL, GARDEC
 python3 autosync.py --test-notify        # one sample push with an attachment
 python3 autosync.py --skip-camera        # dry pass: remote scan + notify only
 ./install-autosync.sh                    # systemd user units, timer left off
+                                         # (GARDECAM_SYNC_GAP=15min ... for a gentler cadence)
 systemctl --user enable --now gardecam-autosync.timer
 ```
 
@@ -94,9 +95,25 @@ random. iOS needs the server's `upstream-base-url` pointed at `https://ntfy.sh`
 so Apple push can wake the app; the message itself is still fetched from your
 server, so the phone must be able to reach it (Tailscale).
 
-Hourly means the camera is woken over Bluetooth and brings its hotspot up every
-hour, which costs battery: fine on mains or solar, noticeable on AA cells. Change
-`OnCalendar` in `install-autosync.sh` for a gentler cadence.
+### Timing
+
+The timer re-fires one minute after each pass ends, so passes run back-to-back.
+A pass that finds nothing new is about 1.5 min (roughly a minute to wake the
+camera and join its hotspot, one listing request, disconnect); a pass with a new
+clip adds the download, the remote detection run (model load plus a few seconds
+per clip), the Immich import and the push, so a clip is usually on the phone
+within 2-4 minutes of the camera finishing it. Notifications are sent only after
+`wildlife.py --remote` has returned, so the clip is already on the GPU host and
+in Immich by the time the alert arrives.
+
+The price is battery and recording: every pass wakes the camera over Bluetooth
+and holds its hotspot up for the length of the pass, and trail cameras generally
+do not trigger on motion while their app link is active. On AA cells this
+cadence will drain them quickly; on mains or a solar pack it is fine. Set
+`GARDECAM_SYNC_GAP=15min` (or whatever) when running `install-autosync.sh` to
+back off. With one wifi radio the laptop is on the camera hotspot most of the
+time in this mode; a USB wifi dongle for the camera (`GARDECAM_IFACE`) keeps its
+normal connection up.
 
 ## How it works
 

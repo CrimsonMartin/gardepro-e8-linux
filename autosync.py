@@ -9,8 +9,9 @@ autosync - one unattended pass of the whole gardecam pipeline.
                              best frame attached, tap opens the annotated
                              clip in the Immich app
 
-Meant to be fired by a timer (see gardecam-autosync.timer); a lock file keeps
-two passes from touching the camera at once. Immich on the remote host picks
+Meant to be fired back-to-back by a timer (see install-autosync.sh); a lock
+file keeps two passes from touching the camera at once, and a pass that finds
+nothing new on the camera ends without the remote round-trip. Immich on the remote host picks
 the annotated clips up on its own, so nothing here talks to Immich.
 
 Usage:
@@ -45,7 +46,7 @@ import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from wildlife import (_load_env, media_files,  # noqa: E402
+from wildlife import (_load_env, media_files, pending_files,  # noqa: E402
                       ANNOTATED_SUBDIR, SIDECAR_SUFFIX)
 
 _load_env()
@@ -273,6 +274,12 @@ def main():
                 log(f"camera sync failed: {e}")
             finally:
                 run(PY, "gardecam.py", "disconnect", check=False)
+        if not pending_files(MEDIA, False):
+            log("nothing new to scan; skipping the remote round-trip")
+            if not camera_ok:
+                raise SystemExit(2)
+            return
+        if not args.skip_camera:
             wait_for_remote()
         run(PY, "wildlife.py", "--remote", "--dir", MEDIA)
     except Exception as e:
