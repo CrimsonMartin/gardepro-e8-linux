@@ -28,7 +28,11 @@ Settings (from .env or the environment):
                       folder, e.g. http://gpu-host:8091/annotated/ - a tap on
                       the notification then plays the clip (unset = tap opens
                       Immich instead)
-  GARDECAM_IMMICH_URL Immich URL, offered as a button on each notification
+  GARDECAM_IMMICH_URL Immich server URL; also used to look the clip up so
+                      the "Immich" button deep-links into the Immich app
+                      (immich://asset?id=...) - needs the API key below
+  GARDECAM_IMMICH_API_KEY  read-only (asset.read) Immich API key; without it
+                      the Immich button just opens the app
   GARDECAM_NOTIFY_MAX max per-clip notifications per pass (default 5); the
                       rest are rolled into one summary message
 """
@@ -57,6 +61,8 @@ LOCK = os.path.join(os.path.expanduser("~"), ".cache", "gardecam-autosync.lock")
 NTFY = os.environ.get("GARDECAM_NTFY_URL", "").strip()
 IMMICH = os.environ.get("GARDECAM_IMMICH_URL", "").strip()
 CLIP_URL = os.environ.get("GARDECAM_CLIP_URL", "").strip()
+IMMICH_KEY = os.environ.get("GARDECAM_IMMICH_API_KEY", "").strip()
+IMMICH_APP = "immich://"  # the mobile app's URL scheme
 NOTIFY_MAX = int(os.environ.get("GARDECAM_NOTIFY_MAX", "5"))
 NOT_WILD = ("human", "vehicle")
 
@@ -123,9 +129,8 @@ def notify(title, message, attachment=None, priority=None, tags=None,
     message = " · ".join(l.strip() for l in message.splitlines() if l.strip())
     headers = {"Title": title.encode("utf-8").decode("latin-1", "replace"),
                "Markdown": "no"}
-    click = click or IMMICH
-    if click:
-        headers["Click"] = click
+    click = click or IMMICH_APP
+    headers["Click"] = click
     if actions:
         headers["Actions"] = "; ".join(
             f"view, {label}, {url}" for label, url in actions if url)
@@ -160,15 +165,49 @@ def clip_when(name):
     return f"{d[:4]}-{d[4:6]}-{d[6:]} {t[:2]}:{t[2:4]}"
 
 
+def immich_asset_id(filename, tries=6, pause=5):
+    """Immich asset id for a file the external library has imported, or None.
+
+    Immich picks new annotated clips up via its folder watch, which can lag
+    the end of the scan by a few seconds, so retry briefly.
+    """
+    if not (IMMICH and IMMICH_KEY):
+        return None
+    url = IMMICH.rstrip("/") + "/api/search/metadata"
+    body = json.dumps({"originalFileName": filename, "size": 1}).encode()
+    for attempt in range(tries):
+        req = urllib.request.Request(
+            url, data=body, method="POST",
+            headers={"x-api-key": IMMICH_KEY,
+                     "Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=15) as r:
+                items = json.load(r).get("assets", {}).get("items", [])
+            if items:
+                return items[0]["id"]
+        except Exception as e:
+            log(f"immich lookup failed: {e}")
+            return None
+        if attempt < tries - 1:
+            time.sleep(pause)
+    return None
+
+
 def clip_link(annotated_video):
     """(tap URL, action buttons) for a clip: the best frame is what gets
-    attached so the notification previews, and the annotated video sits one
-    tap away on the remote host's clip server."""
+    attached so the notification previews, the annotated video sits one tap
+    away on the remote host's clip server, and the Immich button opens the
+    same clip inside the Immich app when it can be looked up."""
     url = None
     if annotated_video and CLIP_URL:
         url = CLIP_URL.rstrip("/") + "/" + urllib.parse.quote(
             os.path.basename(annotated_video))
-    actions = [("Watch clip", url), ("Immich", IMMICH)]
+    app = IMMICH_APP
+    if annotated_video:
+        asset = immich_asset_id(os.path.basename(annotated_video))
+        if asset:
+            app = f"{IMMICH_APP}asset?id={asset}"
+    actions = [("Watch clip", url), ("Immich", app)]
     return url, [a for a in actions if a[1]]
 
 
