@@ -47,6 +47,9 @@ python3 gardecam.py disconnect  # back to the normal network
 ```
 
 Downloads land in `./media` next to the script; `GARDECAM_MEDIA` overrides that.
+With several cameras listed in `GARDECAM_BLE_MAC`, files are prefixed `cam1_`,
+`cam2_`, ... by their position in that list, so keep the list order stable.
+Clips synced before numbering keep their old names and are not re-downloaded.
 The script resolves its own location, so it works from any directory — call it by
 full path or symlink it onto your `PATH` if you prefer.
 

@@ -69,11 +69,18 @@ NUS_ALT = "6e400004-b5a3-f393-e0a9-e50e24dcca9e"
 SSID = "CAM8Z8_" + BLE_MAC.replace(":", "")
 
 
+# 1-based position of the active camera in CAMERAS; downloads are prefixed
+# cam<N>_ so clips from several cameras can share one directory and still say
+# where they came from.
+CAM_INDEX = 1
+
+
 def select_camera(mac):
     """Point the module-level camera identity at another listed camera."""
-    global BLE_MAC, SSID
+    global BLE_MAC, SSID, CAM_INDEX
     BLE_MAC = mac
     SSID = "CAM8Z8_" + mac.replace(":", "")
+    CAM_INDEX = CAMERAS.index(mac) + 1 if mac in CAMERAS else 1
 WIFI_PASS = os.environ.get("GARDECAM_WIFI_PASS", "1234567890")
 PROFILE = "gardecam"
 BASE = "http://192.168.8.1:8080"
@@ -360,7 +367,13 @@ def download(fid, kind, outdir=PHOTO_DIR, date=None):
     stamp = ""
     if date:
         stamp = "_" + str(date).replace(":", "").replace("-", "").replace(" ", "_")
-    path = os.path.join(outdir, f"{fid}{stamp}.{kind.lower()}")
+    name = f"{fid}{stamp}.{kind.lower()}"
+    # Files synced before cameras were numbered have no prefix; treat them as
+    # already downloaded rather than fetching a second copy under the new name.
+    legacy = os.path.join(outdir, name)
+    if os.path.exists(legacy) and os.path.getsize(legacy) > 0:
+        return legacy, False
+    path = os.path.join(outdir, f"cam{CAM_INDEX}_{name}")
     if os.path.exists(path) and os.path.getsize(path) > 0:
         return path, False
     data = api(f"/file/{fid}/{kind}", timeout=300, raw=True)

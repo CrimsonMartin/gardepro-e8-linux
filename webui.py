@@ -75,9 +75,11 @@ def collect(mdir, cutoff=None):
     with no parseable timestamp only show up in the all-time view.
     """
     groups = {}
-    for name in sorted(os.listdir(mdir), reverse=True):
-        if not name.lower().endswith((".mp4", ".jpg", ".jpeg")):
-            continue
+    # Newest first by the timestamp in the name, so clips from several
+    # cameras (cam1_..., cam2_...) interleave instead of grouping by prefix.
+    names = [n for n in os.listdir(mdir)
+             if n.lower().endswith((".mp4", ".jpg", ".jpeg"))]
+    for name in sorted(names, key=lambda n: (parse_date(n), n), reverse=True):
         date = parse_date(name)
         if cutoff is not None:
             if not date:
