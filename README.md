@@ -97,7 +97,8 @@ server, so the phone must be able to reach it (Tailscale).
 
 ### Timing
 
-The timer re-fires one minute after each pass ends, so passes run back-to-back.
+The timer re-fires five minutes after each pass ends (`GARDECAM_SYNC_GAP` at
+install time changes that; `1min` is the fastest sensible setting).
 A pass that finds nothing new is about 1.5 min (roughly a minute to wake the
 camera and join its hotspot, one listing request, disconnect); a pass with a new
 clip adds the download, the remote detection run (model load plus a few seconds
@@ -109,9 +110,9 @@ in Immich by the time the alert arrives.
 The price is battery and recording: every pass wakes the camera over Bluetooth
 and holds its hotspot up for the length of the pass, and trail cameras generally
 do not trigger on motion while their app link is active. On AA cells this
-cadence will drain them quickly; on mains or a solar pack it is fine. Set
-`GARDECAM_SYNC_GAP=15min` (or whatever) when running `install-autosync.sh` to
-back off. With one wifi radio the laptop is on the camera hotspot most of the
+cadence will drain them quickly; on mains or a solar pack it is fine. The
+five-minute gap keeps the camera watching about three-quarters of the time;
+`GARDECAM_SYNC_GAP=15min` when running `install-autosync.sh` backs off further. With one wifi radio the laptop is on the camera hotspot most of the
 time in this mode; a USB wifi dongle for the camera (`GARDECAM_IFACE`) keeps its
 normal connection up.
 

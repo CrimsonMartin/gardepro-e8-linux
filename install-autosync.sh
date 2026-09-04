@@ -1,10 +1,11 @@
 #!/bin/sh
 # Install (but do not enable) the autosync timer for this clone as systemd
 # *user* units, so it runs as you with your ssh keys, .env and bluetooth/wifi
-# permissions. The timer re-fires GAP after each pass ends (default 1min), so
-# passes run back-to-back and a new clip reaches the phone within a few
-# minutes of being recorded. GARDECAM_SYNC_GAP=15min ./install-autosync.sh
-# for something gentler on the camera battery.
+# permissions. The timer re-fires GAP after each pass ends (default 5min):
+# the camera does not record while its app link is up, so the gap is what
+# keeps it watching most of the time; a new clip still reaches the phone
+# within a few minutes. GARDECAM_SYNC_GAP=1min ./install-autosync.sh for
+# the fastest alerts, 15min or more to go easy on battery-powered cameras.
 #
 #   ./install-autosync.sh            install units, leave the timer off
 #   ./install-autosync.sh --enable   install and start the timer
@@ -20,7 +21,7 @@
 set -e
 HERE=$(cd "$(dirname "$0")" && pwd)
 PY=$(command -v python3)
-GAP=${GARDECAM_SYNC_GAP:-1min}
+GAP=${GARDECAM_SYNC_GAP:-5min}
 UNITS="$HOME/.config/systemd/user"
 mkdir -p "$UNITS"
 
