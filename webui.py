@@ -112,6 +112,11 @@ def collect(mdir, cutoff=None):
             if os.path.exists(os.path.join(mdir, poster)):
                 c["poster"] = poster
             c["others"] = [p for p in present if p != label]
+            # wildlife.py renders a copy of the clip with the boxes + labels
+            # tracking the animal; play that when it exists.
+            vid = data.get("annotated_video")
+            if vid and os.path.exists(os.path.join(mdir, vid)):
+                c["annotated"] = vid
             groups.setdefault(label, []).append(c)
         if not present:
             groups.setdefault("nothing detected", []).append(clip)
@@ -272,7 +277,7 @@ def render(mdir, selected, bracket):
         for label in order)
     cards = []
     for c in groups.get(selected, []):
-        src = f"/media/{c['name']}"
+        src = f"/media/{quote(c.get('annotated') or c['name'])}"
         # Detection frame if there is one, else a generated first-frame thumb.
         poster = (f"/media/{c['poster']}" if c.get("poster")
                   else f"/thumb/{quote(c['name'])}" if c["video"] else "")
@@ -346,7 +351,8 @@ class Handler(SimpleHTTPRequestHandler):
         if self.path.startswith("/media/"):
             # Serve media files (with Range support for video scrubbing is
             # not in stdlib; browsers cope with full-file responses).
-            rel = os.path.normpath(self.path[len("/media/"):]).lstrip("/")
+            from urllib.parse import unquote
+            rel = os.path.normpath(unquote(self.path[len("/media/"):])).lstrip("/")
             full = os.path.join(self.mdir, rel)
             if not os.path.abspath(full).startswith(self.mdir + os.sep) \
                     or not os.path.isfile(full):

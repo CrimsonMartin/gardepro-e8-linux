@@ -13,4 +13,4 @@ RUN apt-get update \
 ARG TORCH_INDEX=https://download.pytorch.org/whl/cpu
 RUN pip install --no-cache-dir \
     --extra-index-url ${TORCH_INDEX} \
-    speciesnet opencv-python-headless
+    speciesnet opencv-python-headless imageio-ffmpeg

@@ -13,13 +13,17 @@ Both ship in the `speciesnet` package (google/cameratrapai).
 
 For each media file it writes a sidecar `<name>.wildlife.json` next to the
 original, and for every species found it saves an annotated best frame under
-`<media>/annotated/`. Files whose sidecar was already produced by this engine
-are skipped, so it is safe to re-run after `gardecam.py sync` - only new clips
-(and clips scanned by an older engine) are processed.
+`<media>/annotated/`. For videos with wildlife it also renders an annotated
+copy of the whole clip there (`<stem>_<species>.mp4`): the detector boxes
+from every sampled frame are interpolated across the in-between frames, so
+the box and species label follow the animal through the clip. Files whose
+sidecar was already produced by this engine are skipped, so it is safe to
+re-run after `gardecam.py sync` - only new clips (and clips scanned by an
+older engine) are processed.
 
 Usage:
   wildlife.py [--dir DIR] [--force] [--limit N] [--stride N] [--score S]
-              [--country CC] [--remote] [--report]
+              [--country CC] [--no-video] [--remote] [--report]
 
   --dir DIR      media directory (default: $GARDECAM_MEDIA or ./media)
   --force        reprocess files that already have a current sidecar
@@ -30,6 +34,8 @@ Usage:
                  (default: $GARDECAM_COUNTRY; improves species rollups)
   --all          also record humans and vehicles (ignored by default -
                  only wildlife is reported)
+  --no-video     skip rendering annotated copies of the video clips (the
+                 best-frame jpg is still written)
   --remote       run the scan on $GARDECAM_REMOTE over ssh instead: rsync the
                  media there, run this script on that machine (using its GPU
                  if it has one), and rsync the sidecars + annotated frames back
@@ -51,6 +57,8 @@ CACHE = os.path.join(os.path.expanduser("~"), ".cache", "gardecam-yolo")
 SIDECAR_SUFFIX = ".wildlife.json"
 ANNOTATED_SUBDIR = "annotated"
 ENGINE = "megadetector+speciesnet"
+# bump when Dockerfile.wildlife changes so ensure_image() rebuilds
+IMAGE_VERSION = "2"
 
 
 def _load_env(path=None):
@@ -72,10 +80,11 @@ _load_env()
 # The container-side worker. Kept inline so this stays a single runnable file;
 # it is written to a temp dir and mounted into the container at run time.
 WORKER = r'''
-import json, os, shutil, sys, tempfile
+import json, os, shutil, subprocess, sys, tempfile
 from pathlib import Path
 
 import cv2
+import imageio_ffmpeg
 from speciesnet import DEFAULT_MODEL, SpeciesNet
 
 cfg = json.load(open("/work/job.json"))
@@ -138,6 +147,131 @@ def draw(frame_path, detections, label, text):
     return img
 
 
+def frame_boxes(pred, wanted, min_conf=0.2):
+    """Normalized [x, y, w, h] boxes of the wanted kind in one prediction."""
+    return [d["bbox"] for d in pred.get("detections") or []
+            if d.get("label") == wanted and d.get("conf", 0) >= min_conf
+            and len(d.get("bbox", [])) == 4]
+
+
+def _center(b):
+    return (b[0] + b[2] / 2, b[1] + b[3] / 2)
+
+
+def _match(a, b):
+    """Greedy nearest-centre pairing of boxes a -> boxes b (index pairs)."""
+    pairs, used = [], set()
+    for i, ba in enumerate(a):
+        cx, cy = _center(ba)
+        best, bj = None, None
+        for j, bb in enumerate(b):
+            if j in used:
+                continue
+            dx, dy = _center(bb)
+            d = (cx - dx) ** 2 + (cy - dy) ** 2
+            if best is None or d < best:
+                best, bj = d, j
+        # only pair boxes that are plausibly the same animal (centre moved
+        # less than ~a quarter of the frame between samples)
+        if bj is not None and best < 0.25 ** 2:
+            pairs.append((i, bj))
+            used.add(bj)
+    return pairs
+
+
+def boxes_at(i, keys, kf, stride):
+    """Boxes for raw frame i, interpolated between the sampled frames.
+
+    kf maps sampled frame index -> (label, score, [boxes]). Between two
+    samples matched boxes glide linearly; unmatched ones stay with the
+    nearer sample so an animal that just walked in or out is still boxed.
+    """
+    if not keys:
+        return []
+    k0 = (i // stride) * stride
+    k1 = k0 + stride
+    p0, p1 = kf.get(k0), kf.get(k1)
+    if p1 is None or k1 > keys[-1]:
+        return [(b, p0[0], p0[1]) for b in p0[2]] if p0 else []
+    if p0 is None:
+        return [(b, p1[0], p1[1]) for b in p1[2]]
+    t = (i - k0) / stride
+    out = []
+    pairs = _match(p0[2], p1[2])
+    m0 = {a for a, _ in pairs}
+    m1 = {b for _, b in pairs}
+    for a, b in pairs:
+        ba, bb = p0[2][a], p1[2][b]
+        box = [ba[n] + (bb[n] - ba[n]) * t for n in range(4)]
+        lab, sc = (p0[0], p0[1]) if t < 0.5 else (p1[0], p1[1])
+        out.append((box, lab, sc))
+    near = p0 if t < 0.5 else p1
+    skip = m0 if t < 0.5 else m1
+    for n, b in enumerate(near[2]):
+        if n not in skip:
+            out.append((b, near[0], near[1]))
+    return out
+
+
+def draw_box(img, box, text):
+    h, w = img.shape[:2]
+    x, y, bw, bh = box
+    p1 = (int(x * w), int(y * h))
+    p2 = (int((x + bw) * w), int((y + bh) * h))
+    cv2.rectangle(img, p1, p2, (0, 255, 0), 2)
+    (tw, th), base = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
+    ty = p1[1] - 6 if p1[1] - th - 10 > 0 else p2[1] + th + 6
+    cv2.rectangle(img, (p1[0], ty - th - 4), (p1[0] + tw + 6, ty + base),
+                  (0, 255, 0), -1)
+    cv2.putText(img, text, (p1[0] + 3, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                (0, 0, 0), 2, cv2.LINE_AA)
+
+
+def render_video(src, dst, kf, stride, primary):
+    """Write an annotated H.264 copy of src with boxes that track the animal.
+
+    kf maps sampled frame index -> (label, score, boxes). Frames are piped
+    raw into ffmpeg (bundled by imageio-ffmpeg); the original's audio track
+    is copied across when it has one.
+    """
+    cap = cv2.VideoCapture(str(src))
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    if w > 1280:
+        h, w = int(h * 1280 / w), 1280
+    w, h = w - w % 2, h - h % 2  # yuv420p needs even dimensions
+    tmp = dst.with_suffix(".part.mp4")
+    cmd = [imageio_ffmpeg.get_ffmpeg_exe(), "-y", "-loglevel", "error",
+           "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{w}x{h}",
+           "-r", f"{fps:.3f}", "-i", "pipe:0", "-i", str(src),
+           "-map", "0:v", "-map", "1:a?", "-c:v", "libx264",
+           "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p",
+           "-c:a", "aac", "-shortest", "-movflags", "+faststart", str(tmp)]
+    ff = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+    keys = sorted(kf)
+    i = 0
+    try:
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            if frame.shape[1] != w or frame.shape[0] != h:
+                frame = cv2.resize(frame, (w, h))
+            for box, lab, sc in boxes_at(i, keys, kf, stride):
+                draw_box(frame, box, f"{lab or primary} {sc:.2f}")
+            ff.stdin.write(frame.tobytes())
+            i += 1
+    finally:
+        cap.release()
+        ff.stdin.close()
+        err = ff.stderr.read().decode(errors="replace")
+        if ff.wait() != 0:
+            tmp.unlink(missing_ok=True)
+            raise RuntimeError(f"ffmpeg failed: {err.strip()[:300]}")
+    os.replace(tmp, dst)
+
+
 for name in cfg["files"]:
     src = media / name
     is_video = src.suffix.lower() == ".mp4"
@@ -156,12 +290,19 @@ for name in cfg["files"]:
 
         stats = {}  # label -> {"frames": n, "max_score": s, "prediction": str}
         best = {}   # label -> (score, frame path, detections)
+        kf = {}     # sampled frame index -> (label, score, animal boxes)
         analyzed = 0
         for p in preds.get("predictions", []):
             analyzed += 1
             pred = p.get("prediction") or ""
             score = float(p.get("prediction_score") or 0)
             label = label_of(pred)
+            if is_video:
+                idx = int(Path(p.get("filepath", "f0")).stem[1:])
+                boxes = frame_boxes(p, "animal")
+                good = (label not in ("blank", "no cv result", "human",
+                                      "vehicle") and score >= cfg["score"])
+                kf[idx] = (label if good else None, score, boxes)
             if label in ("blank", "no cv result") or score < cfg["score"]:
                 continue
             if label in ("human", "vehicle") and not cfg.get("all"):
@@ -188,6 +329,20 @@ for name in cfg["files"]:
                 safe = label.replace(" ", "_").replace("/", "_")
                 cv2.imwrite(str(annotated / f"{src.stem}_{safe}.jpg"), img)
 
+        video_out = None
+        wild = [l for l in present if l not in ("human", "vehicle")]
+        if is_video and wild and cfg.get("video"):
+            primary = max(wild, key=lambda l: stats[l]["frames"])
+            # only keep boxes on frames whose species is one we report
+            kf = {k: (lab if lab in present else None, sc, bx)
+                  for k, (lab, sc, bx) in kf.items()}
+            safe = "_".join(l.replace(" ", "_").replace("/", "_")
+                            for l in wild)
+            annotated.mkdir(exist_ok=True)
+            out = annotated / f"{src.stem}_{safe}.mp4"
+            render_video(src, out, kf, stride, primary)
+            video_out = str(out.relative_to(media))
+
         sidecar = {
             "file": name,
             "engine": cfg["engine"],
@@ -196,6 +351,7 @@ for name in cfg["files"]:
             "frames_analyzed": analyzed,
             "species": stats,
             "present": present,
+            "annotated_video": video_out,
         }
         tmp = media / (name + cfg["sidecar_suffix"] + ".part")
         tmp.write_text(json.dumps(sidecar, indent=2))
@@ -216,20 +372,33 @@ def media_files(mdir):
     )
 
 
-def has_current_sidecar(mdir, name):
+def has_current_sidecar(mdir, name, video=True):
+    """True when the sidecar is up to date, so the file can be skipped.
+
+    A wildlife clip whose sidecar predates annotated-video rendering (or
+    whose rendered video is missing) counts as stale so it gets redone;
+    clips with nothing in them are left alone.
+    """
     sc = os.path.join(mdir, name + SIDECAR_SUFFIX)
     if not os.path.exists(sc):
         return False
     try:
         with open(sc) as f:
-            return json.load(f).get("engine") == ENGINE
+            data = json.load(f)
     except (json.JSONDecodeError, OSError):
         return False
+    if data.get("engine") != ENGINE:
+        return False
+    wild = [l for l in data.get("present", []) if l not in ("human", "vehicle")]
+    if video and name.lower().endswith(".mp4") and wild:
+        vid = data.get("annotated_video")
+        return bool(vid) and os.path.exists(os.path.join(mdir, vid))
+    return True
 
 
-def pending_files(mdir, force):
+def pending_files(mdir, force, video=True):
     return [n for n in media_files(mdir)
-            if force or not has_current_sidecar(mdir, n)]
+            if force or not has_current_sidecar(mdir, n, video)]
 
 
 def report(mdir):
@@ -278,7 +447,7 @@ def gpu_available():
 
 
 def ensure_image(gpu):
-    image = f"{IMAGE_BASE}:{'gpu' if gpu else 'cpu'}"
+    image = f"{IMAGE_BASE}:{'gpu' if gpu else 'cpu'}-{IMAGE_VERSION}"
     r = subprocess.run(["docker", "image", "inspect", image],
                        capture_output=True)
     if r.returncode == 0:
@@ -330,11 +499,13 @@ def run_remote(args, mdir):
         cmd += " --force"
     if args.limit:
         cmd += f" --limit {args.limit}"
+    if args.no_video:
+        cmd += " --no-video"
     r = subprocess.run(["ssh", host, cmd])
     if r.returncode:
         raise SystemExit(f"remote scan failed (exit {r.returncode})")
 
-    print("pulling sidecars + annotated frames back...")
+    print("pulling sidecars + annotated frames/videos back...")
     pull = subprocess.run(
         ["rsync", "-a", "--info=stats1",
          "--include=*/", "--include=*" + SIDECAR_SUFFIX,
@@ -355,6 +526,7 @@ def main():
     ap.add_argument("--score", type=float, default=0.3)
     ap.add_argument("--country", default=os.environ.get("GARDECAM_COUNTRY", ""))
     ap.add_argument("--all", action="store_true")
+    ap.add_argument("--no-video", action="store_true")
     ap.add_argument("--remote", action="store_true")
     ap.add_argument("--report", action="store_true")
     args = ap.parse_args()
@@ -371,7 +543,7 @@ def main():
     if not shutil.which("docker"):
         raise SystemExit("docker is required but not installed")
 
-    files = pending_files(mdir, args.force)
+    files = pending_files(mdir, args.force, video=not args.no_video)
     if args.limit:
         files = files[: args.limit]
     if not files:
@@ -393,6 +565,7 @@ def main():
                 "score": args.score,
                 "country": args.country or None,
                 "all": args.all,
+                "video": not args.no_video,
                 "engine": ENGINE,
                 "sidecar_suffix": SIDECAR_SUFFIX,
                 "annotated_subdir": ANNOTATED_SUBDIR,
