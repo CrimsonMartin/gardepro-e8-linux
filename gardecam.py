@@ -568,6 +568,10 @@ def cmd_sync(outdir=PHOTO_DIR, jobs=4):
         print(f"done, {new} new file(s) in {outdir}")
     finally:
         ka.stop()
+        # Drop the camera hotspot straight away rather than waiting for the
+        # camera to time out, so the machine is back on its normal network
+        # (and internet) as soon as the downloads finish.
+        disconnect()
 
 
 def cmd_session(seconds=300):

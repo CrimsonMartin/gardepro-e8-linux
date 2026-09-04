@@ -53,7 +53,7 @@ full path or symlink it onto your `PATH` if you prefer.
 Each command takes roughly a minute to establish the link before it does anything.
 
 **If the machine has one WiFi radio, a camera session drops your internet for its
-duration.** Every command reconnects you afterwards; `disconnect` does it
+duration.** `sync` reconnects you when it finishes; `disconnect` does it
 explicitly if something is interrupted. A cheap USB WiFi dongle removes the
 limitation — point the tool at it with `GARDECAM_IFACE=wlan1`.
 
