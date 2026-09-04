@@ -82,11 +82,9 @@ Docker is only needed on the remote host. A lock file stops two passes from
 overlapping; if the camera is out of range the pass still runs the remote scan
 for anything already on disk and exits non-zero so the journal shows it.
 
-Each notification carries the annotated best frame as its preview; a tap plays
-the annotated clip, served read-only from the GPU host's `annotated/` folder by
-any static file server (set `GARDECAM_CLIP_URL`). An Immich button opens the same
-clip in the Immich mobile app when `GARDECAM_IMMICH_API_KEY` (a read-only key) is
-set, otherwise it just opens the app.
+Each notification carries the annotated best frame as its preview; a tap opens
+the annotated clip in the Immich mobile app when `GARDECAM_IMMICH_API_KEY` (a
+read-only key) is set, otherwise it just opens the app.
 
 Notifications go through a self-hosted [ntfy](https://ntfy.sh) server (a
 one-container `docker compose` on the GPU host). On the phone install the ntfy
