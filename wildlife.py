@@ -242,7 +242,7 @@ def render_video(src, dst, kf, stride, primary):
         h, w = int(h * 1280 / w), 1280
     w, h = w - w % 2, h - h % 2  # yuv420p needs even dimensions
     tmp = dst.with_suffix(".part.mp4")
-    cmd = [imageio_ffmpeg.get_ffmpeg_exe(), "-y", "-loglevel", "error",
+    cmd = [imageio_ffmpeg.get_ffmpeg_exe(), "-nostdin", "-y", "-loglevel", "error",
            "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{w}x{h}",
            "-r", f"{fps:.3f}", "-i", "pipe:0", "-i", str(src),
            "-map", "0:v", "-map", "1:a?", "-c:v", "libx264",

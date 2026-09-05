@@ -538,7 +538,7 @@ def strip_preview_track(path):
             return False
         tmp = path + ".remux.mp4"
         r = sh(
-            f'ffmpeg -v error -y -i "{path}" -map 0:v:0 -map "0:a?" -c copy "{tmp}"',
+            f'ffmpeg -nostdin -v error -y -i "{path}" -map 0:v:0 -map "0:a?" -c copy "{tmp}"',
             timeout=300,
         )
         if r.returncode == 0 and os.path.exists(tmp) and os.path.getsize(tmp) > 0:

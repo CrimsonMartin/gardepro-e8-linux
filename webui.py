@@ -333,12 +333,12 @@ class Handler(SimpleHTTPRequestHandler):
                 self.send_error(404)
                 return
             os.makedirs(tdir, exist_ok=True)
-            r = _sp.run(["ffmpeg", "-v", "error", "-ss", "1", "-i", src,
+            r = _sp.run(["ffmpeg", "-nostdin", "-v", "error", "-ss", "1", "-i", src,
                          "-frames:v", "1", "-vf", "scale=640:-1", "-y", out],
                         capture_output=True)
             if r.returncode or not os.path.exists(out):
                 # Very short clip: retry from the first frame.
-                r = _sp.run(["ffmpeg", "-v", "error", "-i", src, "-frames:v",
+                r = _sp.run(["ffmpeg", "-nostdin", "-v", "error", "-i", src, "-frames:v",
                              "1", "-vf", "scale=640:-1", "-y", out],
                             capture_output=True)
             if not os.path.isfile(out):
