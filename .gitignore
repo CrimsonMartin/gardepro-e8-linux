@@ -2,3 +2,6 @@
 media/
 __pycache__/
 *.pyc
+.venv/
+autosync.log*
+launchd.log

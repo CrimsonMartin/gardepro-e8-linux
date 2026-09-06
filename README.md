@@ -1,6 +1,7 @@
 # gardecam — GardePro E8 from Linux, no phone app
 
 Pulls photos and videos off the trail camera over its own WiFi hotspot.
+Linux is the primary target; macOS works too, with the caveats below.
 
 Tested against a GardePro E8, firmware `V8.2.134 MCU V71`. The E9P is similar but
 not identical — see the notes below for where they differ.
@@ -115,6 +116,90 @@ five-minute gap keeps the camera watching about three-quarters of the time;
 `GARDECAM_SYNC_GAP=15min` when running `install-autosync.sh` backs off further. With one wifi radio the laptop is on the camera hotspot most of the
 time in this mode; a USB wifi dongle for the camera (`GARDECAM_IFACE`) keeps its
 normal connection up.
+
+## Running it from macOS
+
+The camera side works on a Mac, with two differences that are worth knowing
+before you rely on it.
+
+**CoreBluetooth never shows you a MAC.** It hands out a UUID that is stable for
+one Mac and meaningless on any other, so `GARDECAM_BLE_MAC` cannot be used to
+*find* the camera here — only to derive the hotspot name, which it is still
+required for. Take the MAC from a Linux box with `bluetoothctl`, or read it off
+the `CAM8Z8_<MAC>` hotspot in the wifi menu. Finding the camera then falls back
+to its advertised name:
+
+```bash
+python3 gardecam.py scan          # list BLE devices; the camera shows as CAM...
+```
+
+That is enough for one camera. With several in range, pin each Mac-local UUID
+from `scan` in `GARDECAM_BLE_UUID`, since the names are identical.
+
+**Wifi goes through `networksetup`, not NetworkManager.** macOS remembers every
+network it joins and would rank the camera above your real one, so the camera
+hotspot is removed from the preferred list as soon as the join succeeds, and
+`disconnect` bounces the radio to make macOS re-pick the real network. The
+interface defaults to `en0`; override with `GARDECAM_IFACE` if yours differs
+(`networksetup -listallhardwareports`).
+
+### Setup
+
+```bash
+python3 -m venv .venv && .venv/bin/pip install bleak
+cp .env.example .env               # GARDECAM_BLE_MAC, and the autosync settings
+brew install tmux ffmpeg
+```
+
+The first BLE scan makes macOS ask whether the terminal may use Bluetooth. If
+it never asks and `scan` finds nothing, grant it under System Settings >
+Privacy & Security > Bluetooth. Running under tmux inherits the permission of
+whichever terminal started the session.
+
+### Unattended
+
+There is no systemd, so `install-autosync.sh` does not apply. `autosync-loop.sh`
+runs the same passes back to back and is meant to be left in tmux:
+
+```bash
+tmux new -d -s gardecam ./autosync-loop.sh
+tmux attach -t gardecam            # ctrl-b d to leave it running
+tmux kill-session -t gardecam      # stop
+```
+
+`GARDECAM_SYNC_GAP` is a plain number of seconds here (default 300), not a
+systemd time string. Output goes to the tmux scrollback and to `autosync.log`.
+
+To have that session come back by itself after a reboot, `install-autosync-macos.sh`
+writes a launchd agent that starts it at login:
+
+```bash
+./install-autosync-macos.sh --load
+launchctl unload ~/Library/LaunchAgents/com.gardecam.autosync.plist   # stop
+```
+
+Set the Mac to log in automatically, or the agent never runs. Note that a
+launchd agent does not inherit the Bluetooth permission your terminal holds, so
+the first pass started this way may find no camera even when `scan` works in a
+terminal; approve the prompt, or add the venv python under Privacy & Security >
+Bluetooth.
+
+### Keeping the laptop awake
+
+The loop holds a `caffeinate` assertion, which covers idle sleep but **not the
+lid being shut**. For a Mac sitting closed next to the camera:
+
+```bash
+sudo pmset -a disablesleep 1       # never sleep, lid open or closed
+sudo pmset -a sleep 0 standby 0 autopoweroff 0 hibernatemode 0
+sudo pmset -c autorestart 1        # come back up after a power cut
+sudo pmset -b sleep 0              # a brief unplug must not put it under
+```
+
+`sudo pmset -a disablesleep 0` puts it back. Two things to know: a closed
+laptop running flat out has no good way to shed heat, and with sleep disabled a
+real power loss drains the battery to empty rather than sleeping at a low
+threshold.
 
 ## How it works
 

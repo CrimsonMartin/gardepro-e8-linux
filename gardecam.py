@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-gardecam - talk to a GardePro E8 WiFi trail camera from Linux, no phone app.
+gardecam - talk to a GardePro E8 WiFi trail camera from Linux or macOS,
+no phone app.
 
 How the camera works:
   It sleeps with only Bluetooth LE advertising. Writing an AT command to its
@@ -20,6 +21,14 @@ Usage:
   gardecam.py setclock [TZ]        sync camera clock + timezone to this machine
   gardecam.py session [SECONDS]    hold the link open (default 300)
   gardecam.py disconnect           drop camera wifi, return to normal network
+  gardecam.py scan [SECONDS]       list nearby BLE devices (find your camera)
+
+Platforms:
+  Linux drives wifi through NetworkManager (nmcli) and addresses the camera
+  by its Bluetooth MAC. macOS has neither: wifi goes through networksetup
+  and CoreBluetooth hides MACs behind a per-host UUID, so the camera is
+  matched by its advertised name (or GARDECAM_BLE_UUID). GARDECAM_BLE_MAC is
+  still required on both - the hotspot name is derived from it.
 """
 
 import asyncio
@@ -84,7 +93,17 @@ def select_camera(mac):
 WIFI_PASS = os.environ.get("GARDECAM_WIFI_PASS", "1234567890")
 PROFILE = "gardecam"
 BASE = "http://192.168.8.1:8080"
-IFACE = os.environ.get("GARDECAM_IFACE", "wlp0s20f3")
+# macOS names its wifi radio en0 and has no NetworkManager; everything
+# platform-specific in this file branches on IS_MAC.
+IS_MAC = sys.platform == "darwin"
+IFACE = os.environ.get("GARDECAM_IFACE", "en0" if IS_MAC else "wlp0s20f3")
+AIRPORT = ("/System/Library/PrivateFrameworks/Apple80211.framework"
+           "/Versions/Current/Resources/airport")
+# CoreBluetooth never reveals a peripheral's MAC, it invents a UUID per
+# host, so BLE_MAC cannot address the camera on macOS. Pin the UUID here
+# (see `gardecam.py scan`) or leave it unset to match on advertised name.
+BLE_UUID = os.environ.get("GARDECAM_BLE_UUID", "").strip()
+BLE_NAME = os.environ.get("GARDECAM_BLE_NAME", "CAM").strip()
 PHOTO_DIR = os.environ.get("GARDECAM_MEDIA", os.path.join(HERE, "media"))
 
 
@@ -93,7 +112,9 @@ def require_mac():
         raise SystemExit(
             "No camera configured. Copy .env.example to .env and set GARDECAM_BLE_MAC.\n"
             "Find your camera's MAC with:\n"
-            "  bluetoothctl --timeout 20 scan le | grep -i CAM"
+            "  bluetoothctl --timeout 20 scan le | grep -i CAM   (Linux)\n"
+            "macOS cannot read the MAC over Bluetooth at all - take it from a\n"
+            "Linux box, or read it off the CAM8Z8_<MAC> hotspot name."
         )
 
 
@@ -102,6 +123,24 @@ def sh(cmd, timeout=60):
 
 
 # ---------------------------------------------------------------- BLE wake
+
+async def find_camera(BleakScanner, timeout=20):
+    """Resolve the camera to a bleak device.
+
+    Linux addresses it by MAC. On macOS CoreBluetooth exposes only a UUID,
+    so an explicitly pinned GARDECAM_BLE_UUID is used when set and the
+    advertised name otherwise - which means one camera per machine unless
+    the UUIDs are pinned.
+    """
+    if not IS_MAC:
+        return await BleakScanner.find_device_by_address(BLE_MAC, timeout=timeout)
+    if BLE_UUID:
+        return await BleakScanner.find_device_by_address(BLE_UUID, timeout=timeout)
+    for d in await BleakScanner.discover(timeout=timeout):
+        if (d.name or "").upper().startswith(BLE_NAME.upper()):
+            return d
+    return None
+
 
 class BleWaker(threading.Thread):
     """Holds the BLE link open and pulses the wake command.
@@ -125,12 +164,17 @@ class BleWaker(threading.Thread):
 
         # The camera stops advertising while anything holds a connection, so
         # clear a stale link before scanning for it.
-        sh(f"bluetoothctl disconnect {BLE_MAC}")
+        if not IS_MAC:
+            sh(f"bluetoothctl disconnect {BLE_MAC}")
         await asyncio.sleep(2)
-        dev = await BleakScanner.find_device_by_address(BLE_MAC, timeout=20)
+        dev = await find_camera(BleakScanner)
         if dev is None:
+            who = (BLE_UUID or BLE_NAME + "*") if IS_MAC else BLE_MAC
+            hint = " (or Bluetooth is not allowed for this terminal:"\
+                   " Privacy & Security > Bluetooth)" if IS_MAC else ""
             raise RuntimeError(
-                f"camera {BLE_MAC} is not advertising - out of Bluetooth range or powered off"
+                f"camera {who} is not advertising - out of Bluetooth range"
+                f" or powered off{hint}"
             )
         async with BleakClient(dev, timeout=30) as c:
             self.ready.set()
@@ -161,6 +205,23 @@ class BleWaker(threading.Thread):
 # ---------------------------------------------------------------- wifi
 
 def hotspot_visible():
+    """Signal strength of the camera hotspot as a percentage, or None."""
+    if IS_MAC:
+        # airport -s rescans on every call. It reports RSSI in dBm; map it onto
+        # the same rough 0-100 scale nmcli gives so callers stay platform-blind.
+        # The BSSID column is blank without location permission, so the RSSI is
+        # found by scanning for the first negative number after the SSID rather
+        # than by a fixed column index.
+        out = sh(f"{AIRPORT} -s", timeout=40).stdout
+        for line in out.splitlines():
+            line = line.strip()
+            if not line.startswith(SSID + " "):
+                continue
+            for tok in line[len(SSID):].split():
+                if tok.startswith("-") and tok[1:].isdigit():
+                    return str(max(0, min(100, 2 * (int(tok) + 100))))
+            return "?"
+        return None
     sh("nmcli device wifi rescan", timeout=30)
     out = sh("nmcli -t -f SSID,SIGNAL device wifi list", timeout=30).stdout
     for line in out.splitlines():
@@ -170,6 +231,8 @@ def hotspot_visible():
 
 
 def on_camera_wifi():
+    if IS_MAC:
+        return sh(f"ipconfig getifaddr {IFACE}").stdout.strip().startswith("192.168.8.")
     out = sh(f"ip -4 addr show {IFACE}").stdout
     return "192.168.8." in out
 
@@ -182,13 +245,28 @@ def connect_wifi(wait=75):
         sig = hotspot_visible()
         if sig:
             print(f"hotspot {SSID} visible (signal {sig}%), joining...")
-            sh(f"nmcli connection delete {PROFILE}")
-            r = sh(
-                f'nmcli --wait 30 device wifi connect "{SSID}" password "{WIFI_PASS}" name {PROFILE}',
-                timeout=45,
-            )
-            # Never let this profile auto-steal the radio later.
-            sh(f"nmcli connection modify {PROFILE} connection.autoconnect no")
+            if IS_MAC:
+                r = sh(
+                    f'networksetup -setairportnetwork {IFACE} "{SSID}" "{WIFI_PASS}"',
+                    timeout=45,
+                )
+                # macOS remembers every network it joins and would rank the
+                # camera above the real one later; forget it immediately. The
+                # association already up is not affected by the removal.
+                sh(f'networksetup -removepreferredwirelessnetwork {IFACE} "{SSID}"')
+                # networksetup returns as soon as it associates, before DHCP.
+                for _ in range(10):
+                    if on_camera_wifi():
+                        break
+                    time.sleep(1)
+            else:
+                sh(f"nmcli connection delete {PROFILE}")
+                r = sh(
+                    f'nmcli --wait 30 device wifi connect "{SSID}" password "{WIFI_PASS}" name {PROFILE}',
+                    timeout=45,
+                )
+                # Never let this profile auto-steal the radio later.
+                sh(f"nmcli connection modify {PROFILE} connection.autoconnect no")
             if on_camera_wifi():
                 print("joined camera network:", ip_addr())
                 return True
@@ -198,6 +276,8 @@ def connect_wifi(wait=75):
 
 
 def ip_addr():
+    if IS_MAC:
+        return sh(f"ipconfig getifaddr {IFACE}").stdout.strip() or "?"
     for line in sh(f"ip -4 addr show {IFACE}").stdout.splitlines():
         line = line.strip()
         if line.startswith("inet "):
@@ -206,9 +286,32 @@ def ip_addr():
 
 
 def disconnect():
-    sh(f"nmcli connection delete {PROFILE}")
-    sh(f"nmcli device disconnect {IFACE}")
-    sh(f"nmcli device connect {IFACE}")
+    if IS_MAC:
+        # Harmless whether or not we ever joined, and it keeps the camera from
+        # outranking the real network later.
+        sh(f'networksetup -removepreferredwirelessnetwork {IFACE} "{SSID}"')
+        if not on_camera_wifi():
+            print("not on the camera network; nothing to drop")
+            return
+        # macOS has no "leave this network" verb, so the radio gets bounced and
+        # macOS re-picks the best remembered network - the real one, now that
+        # the camera has been forgotten. Skipped above when we were never on
+        # the camera: autosync calls this after every pass, including the ones
+        # where it never came in range, and a needless bounce takes ssh and
+        # Tailscale down with it.
+        sh(f"networksetup -setairportpower {IFACE} off")
+        time.sleep(2)
+        sh(f"networksetup -setairportpower {IFACE} on")
+        # Reassociation takes a few seconds and the caller goes straight on to
+        # talk to the remote host, so don't hand back a dead network.
+        for _ in range(20):
+            if ip_addr() != "?":
+                break
+            time.sleep(1)
+    else:
+        sh(f"nmcli connection delete {PROFILE}")
+        sh(f"nmcli device disconnect {IFACE}")
+        sh(f"nmcli device connect {IFACE}")
     print("camera wifi dropped; back on normal network")
 
 
@@ -278,7 +381,8 @@ def link_up(retries=3):
                 time.sleep(2)
         ka.stop()
         print(f"attempt {attempt}: wifi joined but HTTP not answering, retrying...")
-        sh(f"nmcli connection delete {PROFILE}")
+        if not IS_MAC:
+            sh(f"nmcli connection delete {PROFILE}")
     raise SystemExit("could not establish a link to the camera")
 
 
@@ -685,6 +789,26 @@ def cmd_session(seconds=300):
     print("session ended")
 
 
+def cmd_scan(seconds=20):
+    """List nearby BLE devices so the camera can be identified.
+
+    Linux prints the MAC that goes in GARDECAM_BLE_MAC. macOS prints the
+    CoreBluetooth UUID instead, which is what GARDECAM_BLE_UUID takes; the
+    MAC still has to come from elsewhere because the hotspot name needs it.
+    """
+    from bleak import BleakScanner
+
+    print(f"scanning {seconds}s...")
+    found = asyncio.run(BleakScanner.discover(timeout=seconds))
+    for d in sorted(found, key=lambda d: (d.name or "~")):
+        name = d.name or "?"
+        mark = "  <- camera?" if name.upper().startswith("CAM") else ""
+        print(f"  {d.address}  {name}{mark}")
+    if not found:
+        print("  nothing advertising"
+              + (" (check Bluetooth permission for this terminal)" if IS_MAC else ""))
+
+
 def main():
     args = sys.argv[1:]
     if not args:
@@ -711,6 +835,8 @@ def main():
         cmd_session(int(args[1]) if len(args) > 1 else 300)
     elif cmd == "disconnect":
         disconnect()
+    elif cmd == "scan":
+        cmd_scan(int(args[1]) if len(args) > 1 else 20)
     else:
         print(__doc__)
 
