@@ -156,6 +156,37 @@ it never asks and `scan` finds nothing, grant it under System Settings >
 Privacy & Security > Bluetooth. Running under tmux inherits the permission of
 whichever terminal started the session.
 
+### The one-time wifi authorization
+
+macOS stores wifi passwords in the *System* keychain, and it puts up an
+authorization dialog before writing one. That dialog is fine the first time and
+fatal afterwards: nothing answers it in a detached tmux session, so
+`networksetup` simply blocks until it times out.
+
+So the hotspot is joined with its password only once. After that it stays in
+the preferred networks list - re-pinned to the *last* position on every join,
+so it can never outrank real wifi while the camera is asleep - and later joins
+pass no password at all, which leaves macOS nothing to authorize.
+
+The first `sync`/`info` therefore raises one dialog; approve it and the rest
+are silent. To set a machine up without ever seeing the dialog (over ssh, say),
+seed the keychain and register the network by hand first:
+
+```bash
+sudo security add-generic-password -U -a "CAM8Z8_<MAC>" -s AirPort \
+     -D "AirPort network password" -w "1234567890" -A \
+     /Library/Keychains/System.keychain
+sudo networksetup -addpreferredwirelessnetworkatindex en0 "CAM8Z8_<MAC>" 999 WPA2
+```
+
+The index is clamped to the end of the list, and omitting the password on the
+second command is what keeps it from prompting.
+
+Do not run `gardecam.py` by hand while the autosync agent is loaded. The lock
+file only stops two autosync passes from overlapping; a manual run competes for
+the same Bluetooth radio, and the camera accepts one BLE connection at a time,
+so neither side manages to raise the hotspot.
+
 ### Unattended
 
 There is no systemd, so `install-autosync.sh` does not apply. `autosync-loop.sh`
