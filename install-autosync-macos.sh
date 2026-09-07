@@ -44,6 +44,9 @@ cat > "$PLIST" <<PLISTEOF
     <!-- launchd's default PATH would find macOS's rsync 2.6.9, which does not
          understand the --info flags wildlife.py passes to it. -->
     <key>PATH</key><string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <!-- The loop pipes into tee, so python would block-buffer its progress
+         output and a running pass would look hung. -->
+    <key>PYTHONUNBUFFERED</key><string>1</string>
   </dict>
   <key>RunAtLoad</key><true/>
   <!-- tmux -d returns as soon as the session exists, so there is nothing here

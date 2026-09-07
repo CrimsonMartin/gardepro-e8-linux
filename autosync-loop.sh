@@ -23,6 +23,13 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 # modern rsync, tmux and ffmpeg win wherever this is started from.
 PATH=/usr/local/bin:/opt/homebrew/bin:$PATH
 export PATH
+
+# Everything below is piped into tee, which makes python's stdout a pipe and so
+# block-buffered: progress lines would sit unflushed for minutes and the log
+# would look hung while a pass was in fact running. This covers autosync.py and
+# the gardecam.py/wildlife.py children it spawns.
+PYTHONUNBUFFERED=1
+export PYTHONUNBUFFERED
 GAP=${GARDECAM_SYNC_GAP:-300}
 LOG=${GARDECAM_LOG:-$HERE/autosync.log}
 

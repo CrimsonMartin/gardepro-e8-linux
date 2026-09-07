@@ -119,7 +119,21 @@ def require_mac():
 
 
 def sh(cmd, timeout=60):
-    return subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+    """Run a shell command and return the CompletedProcess.
+
+    A timeout comes back as a failed result rather than an exception. Every
+    caller here treats a non-zero result as "that did not work", and on macOS
+    networksetup can block indefinitely behind an authorization dialog that
+    nothing is going to answer in an unattended run - which used to take the
+    whole sync down with an uncaught TimeoutExpired.
+    """
+    try:
+        return subprocess.run(cmd, shell=True, capture_output=True,
+                              text=True, timeout=timeout)
+    except subprocess.TimeoutExpired as e:
+        return subprocess.CompletedProcess(
+            cmd, 124, e.stdout or "",
+            (e.stderr or "") + f"(timed out after {timeout}s)")
 
 
 # ---------------------------------------------------------------- BLE wake
@@ -204,6 +218,28 @@ class BleWaker(threading.Thread):
 
 # ---------------------------------------------------------------- wifi
 
+def register_hotspot():
+    """Remember the camera hotspot, ranked below every real network (macOS).
+
+    Storing the password up front is what keeps macOS from raising an
+    authorization dialog on each join - one that blocks networksetup until it
+    times out, which no unattended run can answer. Joining a network promotes
+    it to the top of the preferred list, so this re-pins it to the bottom every
+    time; otherwise the camera would outrank the house wifi the moment the
+    hotspot is up.
+    """
+    sh(f'networksetup -removepreferredwirelessnetwork {IFACE} "{SSID}"')
+    last = len(preferred_networks())
+    return sh(f'networksetup -addpreferredwirelessnetworkatindex '
+              f'{IFACE} "{SSID}" {last} WPA2 "{WIFI_PASS}"')
+
+
+def preferred_networks():
+    """Remembered wifi networks, best-ranked first (macOS only)."""
+    out = sh(f"networksetup -listpreferredwirelessnetworks {IFACE}").stdout
+    return [ln.strip() for ln in out.splitlines()[1:] if ln.strip()]
+
+
 def hotspot_visible():
     """Signal strength of the camera hotspot as a percentage, or None."""
     if IS_MAC:
@@ -246,14 +282,26 @@ def connect_wifi(wait=75):
         if sig:
             print(f"hotspot {SSID} visible (signal {sig}%), joining...")
             if IS_MAC:
-                r = sh(
-                    f'networksetup -setairportnetwork {IFACE} "{SSID}" "{WIFI_PASS}"',
-                    timeout=45,
-                )
-                # macOS remembers every network it joins and would rank the
-                # camera above the real one later; forget it immediately. The
-                # association already up is not affected by the removal.
-                sh(f'networksetup -removepreferredwirelessnetwork {IFACE} "{SSID}"')
+                # Registering the network with its password *before* joining is
+                # what stops macOS putting up an authorization dialog on every
+                # join. Forgetting it after each pass (which is what this used
+                # to do) makes every join look like a brand new network, and
+                # the dialog blocks networksetup until it times out. It goes in
+                # at the bottom of the preferred list instead, so it can never
+                # outrank the real network while the camera is asleep.
+                # Passing the password makes networksetup write it to the
+                # System keychain, and macOS puts up a SecurityAgent dialog for
+                # that - which blocks until it times out and can never be
+                # answered in an unattended run. Once the hotspot is a known
+                # preferred network with its password already stored, joining
+                # needs no password argument and so raises nothing.
+                if SSID not in preferred_networks():
+                    register_hotspot()
+                known = SSID in preferred_networks()
+                join = f'networksetup -setairportnetwork {IFACE} "{SSID}"'
+                if not known:
+                    join += f' "{WIFI_PASS}"'
+                r = sh(join, timeout=45)
                 # networksetup returns as soon as it associates, before DHCP.
                 for _ in range(10):
                     if on_camera_wifi():
@@ -287,9 +335,9 @@ def ip_addr():
 
 def disconnect():
     if IS_MAC:
-        # Harmless whether or not we ever joined, and it keeps the camera from
-        # outranking the real network later.
-        sh(f'networksetup -removepreferredwirelessnetwork {IFACE} "{SSID}"')
+        # The hotspot deliberately stays in the preferred list (ranked last by
+        # connect_wifi) - removing it here is what used to make the next join
+        # pop an authorization dialog.
         if not on_camera_wifi():
             print("not on the camera network; nothing to drop")
             return
