@@ -105,6 +105,9 @@ AIRPORT = ("/System/Library/PrivateFrameworks/Apple80211.framework"
 BLE_UUID = os.environ.get("GARDECAM_BLE_UUID", "").strip()
 BLE_NAME = os.environ.get("GARDECAM_BLE_NAME", "CAM").strip()
 PHOTO_DIR = os.environ.get("GARDECAM_MEDIA", os.path.join(HERE, "media"))
+# Raw clips are the bulk of the archive and grow about a gigabyte a day on a
+# busy camera, so sync drops the ones older than this. 0 keeps everything.
+KEEP_DAYS = int(os.environ.get("GARDECAM_KEEP_DAYS", "14") or 0)
 
 
 def require_mac():
@@ -482,8 +485,35 @@ def list_all_files():
     return items
 
 
-def _local_keys(outdir):
-    """{'<id>_<stamp>'} for every clip already on disk (any camera prefix)."""
+LEDGER_NAME = ".gardecam-synced"
+
+
+def _ledger_path(outdir):
+    return os.path.join(outdir, LEDGER_NAME)
+
+
+def _read_ledger(outdir):
+    try:
+        with open(_ledger_path(outdir)) as f:
+            return {ln.strip() for ln in f if ln.strip()}
+    except OSError:
+        return set()
+
+
+def _append_ledger(outdir, keys):
+    if not keys:
+        return
+    try:
+        os.makedirs(outdir, exist_ok=True)
+        with open(_ledger_path(outdir), "a") as f:
+            for k in sorted(keys):
+                f.write(k + "\n")
+    except OSError as e:
+        print(f"  (could not update the sync ledger: {e})")
+
+
+def _disk_keys(outdir):
+    """{'<id>_<stamp>'} for every clip currently on disk (any camera prefix)."""
     keys = set()
     if not os.path.isdir(outdir):
         return keys
@@ -494,9 +524,70 @@ def _local_keys(outdir):
     return keys
 
 
+def _local_keys(outdir):
+    """Ids already fetched: what is on disk now, plus everything ever fetched.
+
+    Old clips get pruned so the disk does not fill, but the camera keeps them
+    on its SD card until it rotates, and a listing entry counts as new purely
+    because it is not local - so without this ledger every pruned clip would be
+    downloaded again on the next pass. Whatever is on disk is folded into the
+    ledger as a side effect, which is what seeds it for an archive that predates
+    it.
+    """
+    disk = _disk_keys(outdir)
+    ledger = _read_ledger(outdir)
+    _append_ledger(outdir, disk - ledger)
+    return disk | ledger
+
+
 def _key(it):
     stamp = str(it.get("date", "")).replace(":", "").replace("-", "").replace(" ", "_")
     return f"{it.get('id')}_{stamp}"
+
+
+def prune_old(outdir, days=None):
+    """Delete raw clips older than `days` from the top level of outdir.
+
+    annotated/ is never walked: those clips are what Immich shows and they are
+    a small fraction of the size. Sidecars stay too - a few KB each, and they
+    are the record of what was seen.
+
+    Age comes from the capture stamp in the file name rather than mtime, which
+    on a copy made by rsync says when the file was transferred rather than when
+    the animal walked past.
+
+    This is only safe because _local_keys consults the ledger as well as the
+    disk: a listing entry counts as new precisely because it is not local, so
+    without that every pruned clip would be downloaded again on the next pass.
+    """
+    days = KEEP_DAYS if days is None else days
+    if days <= 0 or not os.path.isdir(outdir):
+        return
+    cutoff = time.time() - days * 86400
+    freed = gone = 0
+    for name in os.listdir(outdir):
+        m = re.match(r"^(?:cam\d+_)?\d+_(\d{8})_(\d{6})\.mp4$", name, re.I)
+        if not m:
+            continue
+        try:
+            when = time.mktime(time.strptime(m.group(1) + m.group(2),
+                                             "%Y%m%d%H%M%S"))
+        except ValueError:
+            continue
+        if when >= cutoff:
+            continue
+        path = os.path.join(outdir, name)
+        try:
+            size = os.path.getsize(path)
+            os.remove(path)
+        except OSError as e:
+            print(f"  (could not prune {name}: {e})")
+            continue
+        freed += size
+        gone += 1
+    if gone:
+        print(f"pruned {gone} raw clip(s) older than {days}d "
+              f"({freed / 1073741824:.2f} GB freed)")
 
 
 def list_new_files(outdir):
@@ -766,6 +857,9 @@ def cmd_sync(outdir=PHOTO_DIR, jobs=4):
         except Exception as e:
             print(f"camera {mac}: sync failed: {e}")
             failed.append(mac)
+    # After the cameras, not per-camera: one pass over the directory, and it
+    # still runs when a camera was unreachable.
+    prune_old(outdir)
     if failed:
         raise SystemExit(f"{len(failed)} of {len(CAMERAS)} camera(s) failed: "
                          + ", ".join(failed))

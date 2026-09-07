@@ -232,6 +232,29 @@ laptop running flat out has no good way to shed heat, and with sleep disabled a
 real power loss drains the battery to empty rather than sleeping at a low
 threshold.
 
+## Keeping the disk in check
+
+Raw clips are the bulk of what `sync` writes - roughly a gigabyte a day on a
+camera with something to look at - so `sync` deletes the ones older than
+`GARDECAM_KEEP_DAYS` (default 14) when it has finished. Only the top level of
+the media directory is touched: annotated clips, their stills and the sidecars
+stay, so Immich and the phone notifications are unaffected. `GARDECAM_KEEP_DAYS=0`
+turns it off.
+
+Age comes from the capture stamp in the file name rather than mtime, which on a
+copy made by rsync says when the file was transferred rather than when it was
+recorded.
+
+This works because `sync` also keeps a ledger of every id it has downloaded, in
+`.gardecam-synced` beside the media. A listing entry counts as new precisely
+because it is not on disk, so without the ledger every pruned clip would be
+downloaded again on the next pass - the camera holds its own copies until the
+SD card rotates. The ledger seeds itself from whatever is already on disk, so an
+archive that predates it is safe.
+
+Note this prunes wherever `sync` runs. A remote host that receives the media
+over rsync keeps its own copies, since the push has no `--delete`.
+
 ## How it works
 
 The camera sleeps with only Bluetooth LE advertising (`CAM8Z8_NoName_G_E8`).
