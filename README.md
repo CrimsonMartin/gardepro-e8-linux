@@ -163,10 +163,17 @@ authorization dialog before writing one. That dialog is fine the first time and
 fatal afterwards: nothing answers it in a detached tmux session, so
 `networksetup` simply blocks until it times out.
 
-So the hotspot is joined with its password only once. After that it stays in
-the preferred networks list - re-pinned to the *last* position on every join,
-so it can never outrank real wifi while the camera is asleep - and later joins
-pass no password at all, which leaves macOS nothing to authorize.
+The dialog is raised by *creating* the keychain entry, not by joining with a
+password that matches the one already stored. So the hotspot is registered once
+- it stays in the preferred networks list, re-pinned to the *last* position so
+it can never outrank real wifi while the camera is asleep - and every join after
+that passes the password and prompts for nothing.
+
+Do not be tempted to drop the password from later joins to lean on the stored
+credential instead: macOS caches a key derived per access point, and once the
+camera had rebooted on a low battery every such join failed with
+`kCWInvalidPMKErr` until the password was supplied again. An explicit password
+forces the key to be re-derived and is what makes joins survive that.
 
 The first `sync`/`info` therefore raises one dialog; approve it and the rest
 are silent. To set a machine up without ever seeing the dialog (over ssh, say),

@@ -292,19 +292,22 @@ def connect_wifi(wait=75):
                 # the dialog blocks networksetup until it times out. It goes in
                 # at the bottom of the preferred list instead, so it can never
                 # outrank the real network while the camera is asleep.
-                # Passing the password makes networksetup write it to the
-                # System keychain, and macOS puts up a SecurityAgent dialog for
-                # that - which blocks until it times out and can never be
-                # answered in an unattended run. Once the hotspot is a known
-                # preferred network with its password already stored, joining
-                # needs no password argument and so raises nothing.
+                # The password goes on every join. The SecurityAgent dialog that
+                # makes unattended joins hang comes from *creating* the keychain
+                # entry, never from joining with a password that matches the
+                # one already stored - so registering once (below) is the only
+                # step that can prompt. Joining without the password instead,
+                # to lean on the stored credential, looked equivalent and is
+                # not: macOS caches a derived key per access point, and after
+                # the camera rebooted on a sagging battery every such join
+                # failed with kCWInvalidPMKErr until the password was given
+                # again and the key re-derived.
                 if SSID not in preferred_networks():
                     register_hotspot()
-                known = SSID in preferred_networks()
-                join = f'networksetup -setairportnetwork {IFACE} "{SSID}"'
-                if not known:
-                    join += f' "{WIFI_PASS}"'
-                r = sh(join, timeout=45)
+                r = sh(
+                    f'networksetup -setairportnetwork {IFACE} "{SSID}" "{WIFI_PASS}"',
+                    timeout=45,
+                )
                 # networksetup returns as soon as it associates, before DHCP.
                 for _ in range(10):
                     if on_camera_wifi():
@@ -415,7 +418,16 @@ def link_up(retries=3):
             waker.start()
             waker.ready.wait(timeout=45)
             if waker.error:
-                raise SystemExit(f"bluetooth wake failed: {waker.error}")
+                # The camera advertises in bursts to save its battery, and not
+                # at all while anything still holds a BLE link to it, so one
+                # discovery window misses it often. Scanning is passive on our
+                # side and costs the camera nothing; a miss used to abort the
+                # whole pass before the retry loop below ever got a look.
+                print(f"attempt {attempt}: bluetooth wake failed: {waker.error}")
+                if attempt == retries:
+                    raise SystemExit(f"bluetooth wake failed: {waker.error}")
+                time.sleep(5)
+                continue
             joined = connect_wifi()
             waker.stop()
             if not joined:
