@@ -80,8 +80,11 @@ SSID = "CAM8Z8_" + BLE_MAC.replace(":", "")
 
 # 1-based position of the active camera in CAMERAS; downloads are prefixed
 # cam<N>_ so clips from several cameras can share one directory and still say
-# where they came from.
-CAM_INDEX = 1
+# where they came from. When the cameras are split across machines they are
+# each first in their own list, so GARDECAM_CAM_INDEX pins the number a
+# machine uses and keeps the prefixes distinct in the shared media directory.
+CAM_INDEX_BASE = int(os.environ.get("GARDECAM_CAM_INDEX", "1"))
+CAM_INDEX = CAM_INDEX_BASE
 
 
 def select_camera(mac):
@@ -89,7 +92,8 @@ def select_camera(mac):
     global BLE_MAC, SSID, CAM_INDEX
     BLE_MAC = mac
     SSID = "CAM8Z8_" + mac.replace(":", "")
-    CAM_INDEX = CAMERAS.index(mac) + 1 if mac in CAMERAS else 1
+    CAM_INDEX = (CAMERAS.index(mac) + CAM_INDEX_BASE
+                 if mac in CAMERAS else CAM_INDEX_BASE)
 WIFI_PASS = os.environ.get("GARDECAM_WIFI_PASS", "1234567890")
 PROFILE = "gardecam"
 BASE = "http://192.168.8.1:8080"

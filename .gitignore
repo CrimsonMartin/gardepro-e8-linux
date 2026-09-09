@@ -1,5 +1,7 @@
 .env
+.env.bak
 media/
+media-cam*/
 __pycache__/
 *.pyc
 .venv/
