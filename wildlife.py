@@ -241,7 +241,10 @@ def render_video(src, dst, kf, stride, primary):
     if w > 1280:
         h, w = int(h * 1280 / w), 1280
     w, h = w - w % 2, h - h % 2  # yuv420p needs even dimensions
-    tmp = dst.with_suffix(".part.mp4")
+    # Scans from several machines can share this directory, so the temp name
+    # carries the pid: two of them writing one fixed .part could otherwise
+    # rename each other's half-finished file into place.
+    tmp = dst.with_suffix(f".part{os.getpid()}.mp4")
     cmd = [imageio_ffmpeg.get_ffmpeg_exe(), "-nostdin", "-y", "-loglevel", "error",
            "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{w}x{h}",
            "-r", f"{fps:.3f}", "-i", "pipe:0", "-i", str(src),
@@ -353,7 +356,7 @@ for name in cfg["files"]:
             "present": present,
             "annotated_video": video_out,
         }
-        tmp = media / (name + cfg["sidecar_suffix"] + ".part")
+        tmp = media / (name + cfg["sidecar_suffix"] + f".part{os.getpid()}")
         tmp.write_text(json.dumps(sidecar, indent=2))
         os.replace(tmp, media / (name + cfg["sidecar_suffix"]))
         print(f"DONE {name}: {', '.join(present) if present else 'nothing'}",

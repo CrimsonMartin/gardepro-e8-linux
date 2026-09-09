@@ -2,3 +2,5 @@
 media/
 __pycache__/
 *.pyc
+media-cam*/
+.env.bak
