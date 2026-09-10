@@ -116,6 +116,25 @@ five-minute gap keeps the camera watching about three-quarters of the time;
 time in this mode; a USB wifi dongle for the camera (`GARDECAM_IFACE`) keeps its
 normal connection up.
 
+### Only running when the camera is awake
+
+A camera set to trigger at night has nothing to offer during the day, but a
+pass still wakes it and holds its hotspot up for a minute or two, and that is
+the dominant drain on its batteries. `GARDECAM_ACTIVE_START` and
+`GARDECAM_ACTIVE_END` (`HH:MM`) bound the hours worth waking it:
+
+```
+GARDECAM_ACTIVE_START=16:00
+GARDECAM_ACTIVE_END=08:00
+```
+
+A start later than the end spans midnight, which is the usual shape. Outside
+the window the pass still runs - it just does not touch the camera - so a clip
+that landed shortly before the window closed is still scanned and pushed to
+your phone instead of waiting hours for the window to reopen. Leave both unset
+to run around the clock; anything unparseable is treated as unset, so a typo
+cannot silently stop the sync.
+
 ## How it works
 
 The camera sleeps with only Bluetooth LE advertising (`CAM8Z8_NoName_G_E8`).
