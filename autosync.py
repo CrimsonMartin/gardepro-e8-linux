@@ -58,6 +58,39 @@ NTFY = os.environ.get("GARDECAM_NTFY_URL", "").strip()
 IMMICH = os.environ.get("GARDECAM_IMMICH_URL", "").strip()
 IMMICH_KEY = os.environ.get("GARDECAM_IMMICH_API_KEY", "").strip()
 IMMICH_APP = "immich://"  # the mobile app's URL scheme
+# Hours the camera is set to record. Outside them there is nothing to collect,
+# and a pass would still wake the camera and hold its hotspot up, which is what
+# actually drains the batteries. Unset either end to run around the clock.
+ACTIVE_START = os.environ.get("GARDECAM_ACTIVE_START", "").strip()
+ACTIVE_END = os.environ.get("GARDECAM_ACTIVE_END", "").strip()
+
+
+def _hhmm(value):
+    """Minutes past midnight for "HH:MM", or None if that is not a time."""
+    try:
+        hour, minute = (int(part) for part in value.split(":"))
+    except ValueError:
+        return None
+    if not (0 <= hour < 24 and 0 <= minute < 60):
+        return None
+    return hour * 60 + minute
+
+
+def within_active_window(now=None):
+    """Is the camera expected to be recording right now?
+
+    A start later than the end spans midnight, which is the usual shape for a
+    camera that only triggers at night: 16:00 to 08:00 is evening through to
+    morning. Anything unparseable is treated as "no window", so a typo in .env
+    keeps the old always-on behaviour rather than silently stopping the sync.
+    """
+    start, end = _hhmm(ACTIVE_START), _hhmm(ACTIVE_END)
+    if start is None or end is None or start == end:
+        return True
+    now = now or datetime.datetime.now()
+    current = now.hour * 60 + now.minute
+    return start <= current < end if start < end else (
+        current >= start or current < end)
 NOTIFY_MAX = int(os.environ.get("GARDECAM_NOTIFY_MAX", "5"))
 NOT_WILD = ("human", "vehicle")
 
@@ -232,6 +265,14 @@ def main():
     ap.add_argument("--skip-camera", action="store_true")
     ap.add_argument("--test-notify", action="store_true")
     args = ap.parse_args()
+
+    # Outside the camera's hours, skip waking it but still run the pass: a clip
+    # that arrived just before the window closed would otherwise sit unscanned
+    # until the window reopens, and the remote scan never touches the camera.
+    if not args.skip_camera and not within_active_window():
+        log(f"outside the camera's active hours "
+            f"({ACTIVE_START}-{ACTIVE_END}); not waking it this pass")
+        args.skip_camera = True
 
     if args.test_notify:
         if not NTFY:
