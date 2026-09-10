@@ -1,6 +1,7 @@
 # gardecam — GardePro E8 from Linux, no phone app
 
 Pulls photos and videos off the trail camera over its own WiFi hotspot.
+Linux is the primary target; macOS works too, with the caveats below.
 
 Tested against a GardePro E8, firmware `V8.2.134 MCU V71`. The E9P is similar but
 not identical — see the notes below for where they differ.
@@ -116,7 +117,129 @@ five-minute gap keeps the camera watching about three-quarters of the time;
 time in this mode; a USB wifi dongle for the camera (`GARDECAM_IFACE`) keeps its
 normal connection up.
 
-### Only running when the camera is awake
+## Running it from macOS
+
+The camera side works on a Mac, with two differences that are worth knowing
+before you rely on it.
+
+**CoreBluetooth never shows you a MAC.** It hands out a UUID that is stable for
+one Mac and meaningless on any other, so `GARDECAM_BLE_MAC` cannot be used to
+*find* the camera here — only to derive the hotspot name, which it is still
+required for. Take the MAC from a Linux box with `bluetoothctl`, or read it off
+the `CAM8Z8_<MAC>` hotspot in the wifi menu. Finding the camera then falls back
+to its advertised name:
+
+```bash
+python3 gardecam.py scan          # list BLE devices; the camera shows as CAM...
+```
+
+That is enough for one camera. With several in range, pin each Mac-local UUID
+from `scan` in `GARDECAM_BLE_UUID`, since the names are identical.
+
+**Wifi goes through `networksetup`, not NetworkManager.** macOS remembers every
+network it joins and would rank the camera above your real one, so the camera
+hotspot is removed from the preferred list as soon as the join succeeds, and
+`disconnect` bounces the radio to make macOS re-pick the real network. The
+interface defaults to `en0`; override with `GARDECAM_IFACE` if yours differs
+(`networksetup -listallhardwareports`).
+
+### Setup
+
+```bash
+python3 -m venv .venv && .venv/bin/pip install bleak
+cp .env.example .env               # GARDECAM_BLE_MAC, and the autosync settings
+brew install tmux ffmpeg
+```
+
+The first BLE scan makes macOS ask whether the terminal may use Bluetooth. If
+it never asks and `scan` finds nothing, grant it under System Settings >
+Privacy & Security > Bluetooth. Running under tmux inherits the permission of
+whichever terminal started the session.
+
+### The one-time wifi authorization
+
+macOS stores wifi passwords in the *System* keychain, and it puts up an
+authorization dialog before writing one. That dialog is fine the first time and
+fatal afterwards: nothing answers it in a detached tmux session, so
+`networksetup` simply blocks until it times out.
+
+The dialog is raised by *creating* the keychain entry, not by joining with a
+password that matches the one already stored. So the hotspot is registered once
+- it stays in the preferred networks list, re-pinned to the *last* position so
+it can never outrank real wifi while the camera is asleep - and every join after
+that passes the password and prompts for nothing.
+
+Do not be tempted to drop the password from later joins to lean on the stored
+credential instead: macOS caches a key derived per access point, and once the
+camera had rebooted on a low battery every such join failed with
+`kCWInvalidPMKErr` until the password was supplied again. An explicit password
+forces the key to be re-derived and is what makes joins survive that.
+
+The first `sync`/`info` therefore raises one dialog; approve it and the rest
+are silent. To set a machine up without ever seeing the dialog (over ssh, say),
+seed the keychain and register the network by hand first:
+
+```bash
+sudo security add-generic-password -U -a "CAM8Z8_<MAC>" -s AirPort \
+     -D "AirPort network password" -w "1234567890" -A \
+     /Library/Keychains/System.keychain
+sudo networksetup -addpreferredwirelessnetworkatindex en0 "CAM8Z8_<MAC>" 999 WPA2
+```
+
+The index is clamped to the end of the list, and omitting the password on the
+second command is what keeps it from prompting.
+
+Do not run `gardecam.py` by hand while the autosync agent is loaded. The lock
+file only stops two autosync passes from overlapping; a manual run competes for
+the same Bluetooth radio, and the camera accepts one BLE connection at a time,
+so neither side manages to raise the hotspot.
+
+### Unattended
+
+There is no systemd, so `install-autosync.sh` does not apply. `autosync-loop.sh`
+runs the same passes back to back and is meant to be left in tmux:
+
+```bash
+tmux new -d -s gardecam ./autosync-loop.sh
+tmux attach -t gardecam            # ctrl-b d to leave it running
+tmux kill-session -t gardecam      # stop
+```
+
+`GARDECAM_SYNC_GAP` is a plain number of seconds here (default 300), not a
+systemd time string. Output goes to the tmux scrollback and to `autosync.log`.
+
+To have that session come back by itself after a reboot, `install-autosync-macos.sh`
+writes a launchd agent that starts it at login:
+
+```bash
+./install-autosync-macos.sh --load
+launchctl unload ~/Library/LaunchAgents/com.gardecam.autosync.plist   # stop
+```
+
+Set the Mac to log in automatically, or the agent never runs. Note that a
+launchd agent does not inherit the Bluetooth permission your terminal holds, so
+the first pass started this way may find no camera even when `scan` works in a
+terminal; approve the prompt, or add the venv python under Privacy & Security >
+Bluetooth.
+
+### Keeping the laptop awake
+
+The loop holds a `caffeinate` assertion, which covers idle sleep but **not the
+lid being shut**. For a Mac sitting closed next to the camera:
+
+```bash
+sudo pmset -a disablesleep 1       # never sleep, lid open or closed
+sudo pmset -a sleep 0 standby 0 autopoweroff 0 hibernatemode 0
+sudo pmset -c autorestart 1        # come back up after a power cut
+sudo pmset -b sleep 0              # a brief unplug must not put it under
+```
+
+`sudo pmset -a disablesleep 0` puts it back. Two things to know: a closed
+laptop running flat out has no good way to shed heat, and with sleep disabled a
+real power loss drains the battery to empty rather than sleeping at a low
+threshold.
+
+## Only running when the camera is awake
 
 A camera set to trigger at night has nothing to offer during the day, but a
 pass still wakes it and holds its hotspot up for a minute or two, and that is
@@ -134,6 +257,29 @@ that landed shortly before the window closed is still scanned and pushed to
 your phone instead of waiting hours for the window to reopen. Leave both unset
 to run around the clock; anything unparseable is treated as unset, so a typo
 cannot silently stop the sync.
+
+## Keeping the disk in check
+
+Raw clips are the bulk of what `sync` writes - roughly a gigabyte a day on a
+camera with something to look at - so `sync` deletes the ones older than
+`GARDECAM_KEEP_DAYS` (default 14) when it has finished. Only the top level of
+the media directory is touched: annotated clips, their stills and the sidecars
+stay, so Immich and the phone notifications are unaffected. `GARDECAM_KEEP_DAYS=0`
+turns it off.
+
+Age comes from the capture stamp in the file name rather than mtime, which on a
+copy made by rsync says when the file was transferred rather than when it was
+recorded.
+
+This works because `sync` also keeps a ledger of every id it has downloaded, in
+`.gardecam-synced` beside the media. A listing entry counts as new precisely
+because it is not on disk, so without the ledger every pruned clip would be
+downloaded again on the next pass - the camera holds its own copies until the
+SD card rotates. The ledger seeds itself from whatever is already on disk, so an
+archive that predates it is safe.
+
+Note this prunes wherever `sync` runs. A remote host that receives the media
+over rsync keeps its own copies, since the push has no `--delete`.
 
 ## How it works
 

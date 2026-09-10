@@ -1,6 +1,9 @@
 .env
+.env.bak
 media/
+media-cam*/
 __pycache__/
 *.pyc
-media-cam*/
-.env.bak
+.venv/
+autosync.log*
+launchd.log
