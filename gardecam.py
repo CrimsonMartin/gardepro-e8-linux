@@ -368,8 +368,25 @@ def disconnect():
             time.sleep(1)
     else:
         sh(f"nmcli connection delete {PROFILE}")
+        # `device disconnect` marks the radio manually-disconnected, which
+        # suppresses autoconnect until something explicitly brings it back up.
+        # The reconnect below used to be fire-and-forget, so when it failed -
+        # the camera's hotspot is still collapsing as we ask - the machine was
+        # left with no network and nothing to retry, which has stranded a
+        # laptop mid-pass. Verify we actually got an address, and keep asking.
         sh(f"nmcli device disconnect {IFACE}")
-        sh(f"nmcli device connect {IFACE}")
+        for attempt in range(1, 5):
+            sh(f"nmcli device connect {IFACE}", timeout=45)
+            for _ in range(10):
+                if ip_addr() != "?":
+                    break
+                time.sleep(1)
+            if ip_addr() != "?":
+                break
+            print(f"  reconnect attempt {attempt} got no address; retrying")
+        else:
+            print("  WARNING: no address after leaving the camera network; "
+                  "the radio may need `nmcli device connect` by hand")
     print("camera wifi dropped; back on normal network")
 
 
