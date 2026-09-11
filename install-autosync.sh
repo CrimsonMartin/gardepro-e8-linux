@@ -34,6 +34,9 @@ Description=gardecam: sync camera, detect wildlife on the remote GPU host, notif
 Type=oneshot
 WorkingDirectory=$HERE
 ExecStart=$PY $HERE/autosync.py
+# Without this python block-buffers into the journal, so a pass in progress
+# looks exactly like a hung one and there is nothing to diagnose from.
+Environment=PYTHONUNBUFFERED=1
 # A first full sync or a big scan can take a while; don't let systemd kill it.
 TimeoutStartSec=3h
 Nice=10
