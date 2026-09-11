@@ -580,7 +580,7 @@ def prune_old(outdir, days=None):
     if days <= 0 or not os.path.isdir(outdir):
         return
     cutoff = time.time() - days * 86400
-    freed = gone = 0
+    freed = gone = kept_unscanned = 0
     for name in os.listdir(outdir):
         m = re.match(r"^(?:cam\d+_)?\d+_(\d{8})_(\d{6})\.mp4$", name, re.I)
         if not m:
@@ -593,6 +593,14 @@ def prune_old(outdir, days=None):
         if when >= cutoff:
             continue
         path = os.path.join(outdir, name)
+        # Never drop a clip that has not been scanned yet. The sidecar is the
+        # evidence it reached the remote host; without this check a camera with
+        # a wrong clock hands over footage that already looks older than the
+        # window, and the prune deletes it in the same pass that fetched it -
+        # which is exactly how 127 clips were lost before this guard existed.
+        if not os.path.exists(path + ".wildlife.json"):
+            kept_unscanned += 1
+            continue
         try:
             size = os.path.getsize(path)
             os.remove(path)
@@ -604,6 +612,9 @@ def prune_old(outdir, days=None):
     if gone:
         print(f"pruned {gone} raw clip(s) older than {days}d "
               f"({freed / 1073741824:.2f} GB freed)")
+    if kept_unscanned:
+        print(f"kept {kept_unscanned} unscanned clip(s) that are past the "
+              f"{days}d window - check the camera's clock")
 
 
 def list_new_files(outdir):
