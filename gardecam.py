@@ -274,11 +274,38 @@ def hotspot_visible():
     return None
 
 
-def on_camera_wifi():
+def current_ssid():
+    """SSID the radio is associated with right now, or "" if none."""
+    if IS_MAC:
+        for line in sh(f"{AIRPORT} -I").stdout.splitlines():
+            line = line.strip()
+            if line.startswith("SSID:"):
+                return line.split(":", 1)[1].strip()
+        return ""
+    for line in sh("nmcli -t -f active,ssid dev wifi").stdout.splitlines():
+        if line.startswith("yes:"):
+            return line[4:]
+    return ""
+
+
+def on_any_camera_wifi():
+    """On some camera's hotspot - every one of them hands out 192.168.8.x."""
     if IS_MAC:
         return sh(f"ipconfig getifaddr {IFACE}").stdout.strip().startswith("192.168.8.")
-    out = sh(f"ip -4 addr show {IFACE}").stdout
-    return "192.168.8." in out
+    return "192.168.8." in sh(f"ip -4 addr show {IFACE}").stdout
+
+
+def on_camera_wifi():
+    """On THIS camera's hotspot, not merely a camera hotspot.
+
+    Every camera uses the same 192.168.8.x subnet, so the address alone cannot
+    tell them apart. With several cameras on one machine the sync walks from
+    one hotspot to the next, and a check that only looked at the address took
+    "still on the previous camera" for "already joined this one": it skipped
+    the wake, talked to the wrong camera, and timed out - three passes out of
+    four in one night. The SSID carries the camera's MAC, so it is unambiguous.
+    """
+    return on_any_camera_wifi() and current_ssid() == SSID
 
 
 def connect_wifi(wait=75):
@@ -356,7 +383,7 @@ def disconnect():
         # The hotspot deliberately stays in the preferred list (ranked last by
         # connect_wifi) - removing it here is what used to make the next join
         # pop an authorization dialog.
-        if not on_camera_wifi():
+        if not on_any_camera_wifi():
             print("not on the camera network; nothing to drop")
             return
         # macOS has no "leave this network" verb, so the radio gets bounced and
@@ -371,7 +398,7 @@ def disconnect():
         # Reassociation takes a few seconds and the caller goes straight on to
         # talk to the remote host, so don't hand back a dead network.
         for _ in range(20):
-            if ip_addr() != "?":
+            if ip_addr() != "?" and not on_any_camera_wifi():
                 break
             time.sleep(1)
     else:
@@ -394,10 +421,10 @@ def disconnect():
         for attempt in range(1, 5):
             sh(f"nmcli device connect {IFACE}", timeout=45)
             for _ in range(10):
-                if ip_addr() != "?":
+                if ip_addr() != "?" and not on_any_camera_wifi():
                     break
                 time.sleep(1)
-            if ip_addr() != "?":
+            if ip_addr() != "?" and not on_any_camera_wifi():
                 break
             print(f"  reconnect attempt {attempt} got no address; retrying")
         else:
@@ -449,6 +476,9 @@ def link_up(retries=3):
     require_mac()
     for attempt in range(1, retries + 1):
         waker = None
+        if on_any_camera_wifi() and not on_camera_wifi():
+            print(f"still on another camera's hotspot ({current_ssid()}); dropping it")
+            disconnect()
         if not on_camera_wifi():
             print("waking camera over Bluetooth (holding link open)...")
             waker = BleWaker()
