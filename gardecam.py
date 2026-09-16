@@ -265,8 +265,9 @@ def hotspot_visible():
                     return str(max(0, min(100, 2 * (int(tok) + 100))))
             return "?"
         return None
-    sh("nmcli device wifi rescan", timeout=30)
-    out = sh("nmcli -t -f SSID,SIGNAL device wifi list", timeout=30).stdout
+    # Scan only the camera radio so a second (backbone) radio is left alone.
+    sh(f"nmcli device wifi rescan ifname {IFACE}", timeout=30)
+    out = sh(f"nmcli -t -f SSID,SIGNAL device wifi list ifname {IFACE}", timeout=30).stdout
     for line in out.splitlines():
         if line.startswith(SSID + ":"):
             return line.rsplit(":", 1)[-1]
@@ -319,12 +320,19 @@ def connect_wifi(wait=75):
                     time.sleep(1)
             else:
                 sh(f"nmcli connection delete {PROFILE}")
-                r = sh(
-                    f'nmcli --wait 30 device wifi connect "{SSID}" password "{WIFI_PASS}" name {PROFILE}',
-                    timeout=45,
+                # Build the profile first so it activates with the right
+                # settings: bound to the camera radio (IFACE), never
+                # auto-connecting, and never supplying a default route or DNS -
+                # the camera net is 192.168.8.0/24 only, so with a second radio
+                # (a USB dongle) the real network keeps carrying everything else.
+                sh(
+                    f'nmcli connection add type wifi ifname {IFACE} con-name {PROFILE} '
+                    f'ssid "{SSID}" wifi-sec.key-mgmt wpa-psk wifi-sec.psk "{WIFI_PASS}" '
+                    f'connection.autoconnect no ipv4.never-default yes '
+                    f'ipv4.ignore-auto-dns yes ipv6.method disabled',
+                    timeout=20,
                 )
-                # Never let this profile auto-steal the radio later.
-                sh(f"nmcli connection modify {PROFILE} connection.autoconnect no")
+                r = sh(f"nmcli --wait 30 connection up {PROFILE}", timeout=45)
             if on_camera_wifi():
                 print("joined camera network:", ip_addr())
                 return True
@@ -368,6 +376,14 @@ def disconnect():
             time.sleep(1)
     else:
         sh(f"nmcli connection delete {PROFILE}")
+        # A dedicated camera radio (GARDECAM_IFACE set to a USB dongle) has
+        # nothing to reconnect to: the backbone lives on another interface and
+        # was never touched, so leave the dongle idle for the next pass.
+        routes = sh("ip -4 route show default").stdout
+        if routes.strip() and f" dev {IFACE} " not in routes:
+            print(f"dedicated camera radio {IFACE}; backbone untouched:",
+                  routes.strip().splitlines()[0])
+            return
         # `device disconnect` marks the radio manually-disconnected, which
         # suppresses autoconnect until something explicitly brings it back up.
         # The reconnect below used to be fire-and-forget, so when it failed -
