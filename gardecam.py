@@ -282,12 +282,20 @@ def current_ssid():
             if line.startswith("SSID:"):
                 return line.split(":", 1)[1].strip()
         return ""
-    # Scoped to the camera radio: with a second (backbone) radio the unscoped
-    # list shows both networks as active and the first hit is the wrong one.
-    for line in sh(f"nmcli -t -f active,ssid dev wifi ifname {IFACE}").stdout.splitlines():
-        if line.startswith("yes:"):
-            return line[4:]
-    return ""
+    # Not the scan list: its "active" column comes from the scan cache, and a
+    # radio that has just associated (the USB dongle, every time) is not in it
+    # yet, so this reported no SSID for a link that was up - and every
+    # successful join was judged the wrong camera and dropped, on a loop. Ask
+    # NetworkManager which profile is active on this radio, then read that
+    # profile's SSID; neither depends on a scan.
+    out = sh(f"nmcli -t -f GENERAL.CONNECTION device show {IFACE}").stdout
+    name = next((ln.split(":", 1)[1] for ln in out.splitlines()
+                 if ln.startswith("GENERAL.CONNECTION:")), "").strip()
+    if not name:
+        return ""
+    out = sh(f'nmcli -t -f 802-11-wireless.ssid connection show "{name}"').stdout
+    return next((ln.split(":", 1)[1] for ln in out.splitlines()
+                 if ln.startswith("802-11-wireless.ssid:")), "").strip()
 
 
 def on_any_camera_wifi():
