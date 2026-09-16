@@ -420,6 +420,13 @@ def disconnect():
         if routes.strip() and f" dev {IFACE} " not in routes:
             print(f"dedicated camera radio {IFACE}; backbone untouched:",
                   routes.strip().splitlines()[0])
+            # The address outlives the deleted profile by a second or two;
+            # hand back a radio that is actually free, or the next camera's
+            # link_up reads "on a camera subnet, no SSID" and drops it again.
+            for _ in range(8):
+                if not on_any_camera_wifi():
+                    break
+                time.sleep(1)
             return
         # `device disconnect` marks the radio manually-disconnected, which
         # suppresses autoconnect until something explicitly brings it back up.
@@ -487,8 +494,18 @@ def link_up(retries=3):
     for attempt in range(1, retries + 1):
         waker = None
         if on_any_camera_wifi() and not on_camera_wifi():
-            print(f"still on another camera's hotspot ({current_ssid()}); dropping it")
-            disconnect()
+            other = current_ssid()
+            if other:
+                print(f"still on another camera's hotspot ({other}); dropping it")
+                disconnect()
+            else:
+                # No active profile but the camera-subnet address is still
+                # there: the previous link is mid-teardown. Give it a moment
+                # rather than bouncing the radio for a hotspot that is gone.
+                for _ in range(8):
+                    if not on_any_camera_wifi():
+                        break
+                    time.sleep(1)
         if not on_camera_wifi():
             print("waking camera over Bluetooth (holding link open)...")
             waker = BleWaker()
