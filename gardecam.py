@@ -282,7 +282,9 @@ def current_ssid():
             if line.startswith("SSID:"):
                 return line.split(":", 1)[1].strip()
         return ""
-    for line in sh("nmcli -t -f active,ssid dev wifi").stdout.splitlines():
+    # Scoped to the camera radio: with a second (backbone) radio the unscoped
+    # list shows both networks as active and the first hit is the wrong one.
+    for line in sh(f"nmcli -t -f active,ssid dev wifi ifname {IFACE}").stdout.splitlines():
         if line.startswith("yes:"):
             return line[4:]
     return ""
@@ -699,7 +701,12 @@ def list_new_files(outdir):
         if all(_key(it) in local for it in fresh):
             break
         start = min(it["id"] for it in fresh)
-    return items
+    # Until now every listed entry was handed to download(), which dedups on
+    # the file being on disk - so a clip renamed on disk (a camera with a reset
+    # clock, redated afterwards) was fetched again on every pass, pruned again
+    # as stale, and pushed to the remote host again: the ledger only ever
+    # decided when to stop paging. Filter here, so the ledger is what decides.
+    return [it for it in items if _key(it) not in local], len(items)
 
 
 def cmd_list(count=20):
@@ -959,16 +966,19 @@ def _sync_camera(outdir, jobs):
     from concurrent.futures import ThreadPoolExecutor, as_completed
     ka = link_up()
     try:
-        items = list_new_files(outdir)
+        items, listed = list_new_files(outdir)
         if not items:
-            print("no files reported by camera; raw response:")
-            print(json.dumps(list_files(50), indent=2)[:2000])
+            if listed:
+                print(f"camera reports {listed} file(s), all already synced")
+            else:
+                print("no files reported by camera; raw response:")
+                print(json.dumps(list_files(50), indent=2)[:2000])
             return
         items = [it for it in items
                  if isinstance(it, dict) and it.get("id") is not None]
         total_mb = sum(i.get("size", 0) for i in items) / 1048576
-        print(f"camera reports {len(items)} file(s), {total_mb:.1f} MB; "
-              f"syncing to {outdir} with {jobs} worker(s)")
+        print(f"camera reports {len(items)} new of {listed} file(s), "
+              f"{total_mb:.1f} MB; syncing to {outdir} with {jobs} worker(s)")
         new, failed = 0, []
         with ThreadPoolExecutor(max_workers=max(1, jobs)) as pool:
             futs = {pool.submit(_sync_one, it, outdir): it for it in items}
