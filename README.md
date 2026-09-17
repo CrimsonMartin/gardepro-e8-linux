@@ -281,6 +281,19 @@ archive that predates it is safe.
 Note this prunes wherever `sync` runs. A remote host that receives the media
 over rsync keeps its own copies, since the push has no `--delete`.
 
+## Keeping the SD card from filling
+
+A full SD card stops the camera recording while it still answers every
+Bluetooth wake and hotspot join, so from the sync's side it looks exactly like
+a quiet night. Every pass now prints the card's usage and battery, and warns
+from 90%. With `GARDECAM_PURGE_KEEP=100` set, each pass also deletes from the
+card the clips earlier passes have already secured - downloaded, scanned and
+pushed to the remote host, proven by the sidecar being on disk - leaving the
+newest 100 as a buffer and removing at most `GARDECAM_PURGE_MAX` (300) per
+pass. The sidecar only comes back a pass after the download, so a clip is never
+deleted in the pass that fetched it. `gardecam.py purge` does the same by hand
+and is a dry run unless given `--apply`.
+
 ## How it works
 
 The camera sleeps with only Bluetooth LE advertising (`CAM8Z8_NoName_G_E8`).
