@@ -103,7 +103,17 @@ BASE = "http://192.168.8.1:8080"
 # macOS names its wifi radio en0 and has no NetworkManager; everything
 # platform-specific in this file branches on IS_MAC.
 IS_MAC = sys.platform == "darwin"
-IFACE = os.environ.get("GARDECAM_IFACE", "en0" if IS_MAC else "wlp0s20f3")
+# One radio, or several to try in order: "wlx_dongle,wlp0s20f3". With more
+# than one, each camera visit scans them all and joins from the first whose
+# signal reaches GARDECAM_MIN_SIGNAL, falling back to whichever hears the
+# hotspot best. A cheap dongle keeps the laptop on the house network during a
+# pass; the built-in radio usually has the better antenna. Listing both gets
+# the dongle whenever it is good enough and the real radio when it is not.
+IFACES = [i.strip() for i in
+          os.environ.get("GARDECAM_IFACE", "en0" if IS_MAC else "wlp0s20f3")
+          .split(",") if i.strip()]
+IFACE = IFACES[0]
+MIN_SIGNAL = int(os.environ.get("GARDECAM_MIN_SIGNAL", "0") or 0)
 AIRPORT = ("/System/Library/PrivateFrameworks/Apple80211.framework"
            "/Versions/Current/Resources/airport")
 # CoreBluetooth never reveals a peripheral's MAC, it invents a UUID per
@@ -275,12 +285,49 @@ def hotspot_visible():
             return "?"
         return None
     # Scan only the camera radio so a second (backbone) radio is left alone.
-    sh(f"nmcli device wifi rescan ifname {IFACE}", timeout=30)
-    out = sh(f"nmcli -t -f SSID,SIGNAL device wifi list ifname {IFACE}", timeout=30).stdout
+    return _scan_signal(IFACE)
+
+
+def _scan_signal(iface):
+    """Linux: rescan one radio and return the hotspot's signal (str %) or None."""
+    sh(f"nmcli device wifi rescan ifname {iface}", timeout=30)
+    out = sh(f"nmcli -t -f SSID,SIGNAL device wifi list ifname {iface}", timeout=30).stdout
     for line in out.splitlines():
         if line.startswith(SSID + ":"):
             return line.rsplit(":", 1)[-1]
     return None
+
+
+def _pick_radio():
+    """Choose which of IFACES joins this camera; returns its signal like
+    hotspot_visible(), or None if no radio hears the hotspot yet.
+
+    The first radio listed is preferred - the dongle that leaves the laptop's
+    own network alone - but only while it actually hears the camera at
+    MIN_SIGNAL or better. A dongle sitting next to a printer's Wi-Fi Direct
+    beacon read the cameras 25 points below the built-in radio one evening
+    and every download died within a minute; the built-in card pulled the
+    same clips at 57%. Below the bar, the strongest reading wins.
+    """
+    global IFACE
+    seen = []
+    for iface in IFACES:
+        sig = _scan_signal(iface)
+        if sig and sig.isdigit():
+            seen.append((int(sig), iface))
+            if int(sig) >= MIN_SIGNAL:
+                break
+    if not seen:
+        return None
+    seen_str = ", ".join(f"{i} {s}%" for s, i in seen)
+    best = max(seen)
+    ok = [x for x in seen if x[0] >= MIN_SIGNAL]
+    sig, iface = ok[0] if ok else best
+    if len(seen) > 1 or iface != IFACE:
+        print(f"radios: {seen_str}; using {iface}"
+              + ("" if ok else f" (none reach {MIN_SIGNAL}%)"))
+    IFACE = iface
+    return str(sig)
 
 
 def current_ssid():
@@ -332,7 +379,10 @@ def connect_wifi(wait=75):
         return True
     deadline = time.time() + wait
     while time.time() < deadline:
-        sig = hotspot_visible()
+        if len(IFACES) > 1 and not IS_MAC:
+            sig = _pick_radio()
+        else:
+            sig = hotspot_visible()
         if sig:
             print(f"hotspot {SSID} visible (signal {sig}%), joining...")
             if IS_MAC:

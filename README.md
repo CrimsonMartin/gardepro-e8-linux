@@ -59,7 +59,11 @@ Each command takes roughly a minute to establish the link before it does anythin
 **If the machine has one WiFi radio, a camera session drops your internet for its
 duration.** `sync` reconnects you when it finishes; `disconnect` does it
 explicitly if something is interrupted. A cheap USB WiFi dongle removes the
-limitation — point the tool at it with `GARDECAM_IFACE=wlan1`.
+limitation — point the tool at it with `GARDECAM_IFACE=wlan1`. Cheap dongles
+hear less than the built-in radio, though; list both
+(`GARDECAM_IFACE=wlan1,wlp0s20f3` with `GARDECAM_MIN_SIGNAL=45`) and each camera
+is visited from the dongle when its signal is good enough and from the built-in
+radio when it is not.
 
 ## Unattended: continuous sync + wildlife alerts on your phone
 
