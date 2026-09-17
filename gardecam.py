@@ -455,7 +455,8 @@ def disconnect():
 
 # ---------------------------------------------------------------- HTTP API
 
-def api(path, timeout=15, raw=False, max_bytes=4 * 1024 * 1024, deadline=None):
+def api(path, timeout=15, raw=False, max_bytes=4 * 1024 * 1024, deadline=None,
+        stall=None):
     """GET from the camera, bounded by wall clock and by size.
 
     urlopen's timeout is per socket operation, so a response that keeps
@@ -475,6 +476,12 @@ def api(path, timeout=15, raw=False, max_bytes=4 * 1024 * 1024, deadline=None):
     """
     url = BASE + path
     deadline = time.time() + (timeout if deadline is None else deadline)
+    # `stall` is the longest silence tolerated once data has started flowing.
+    # A queued request may wait a long time for its first byte behind the
+    # camera's single-threaded server, but a link that goes quiet mid-transfer
+    # is dead: the hotspot dropped, and every socket to it will sit ESTAB
+    # receiving nothing until its full timeout runs out.
+    stall = timeout if stall is None else stall
     chunks, size = [], 0
     with urllib.request.urlopen(url, timeout=timeout) as r:
         while True:
@@ -483,7 +490,8 @@ def api(path, timeout=15, raw=False, max_bytes=4 * 1024 * 1024, deadline=None):
                 raise TimeoutError(f"{path}: no complete response within {timeout}s "
                                    f"({size} bytes so far)")
             # Cap each socket wait by what is left of the overall budget.
-            r.fp.raw._sock.settimeout(max(0.5, min(remaining, timeout))) if hasattr(r.fp, "raw") and hasattr(r.fp.raw, "_sock") and r.fp.raw._sock else None
+            per_read = stall if size else timeout
+            r.fp.raw._sock.settimeout(max(0.5, min(remaining, per_read))) if hasattr(r.fp, "raw") and hasattr(r.fp.raw, "_sock") and r.fp.raw._sock else None
             chunk = r.read(65536)
             if not chunk:
                 break
@@ -821,7 +829,7 @@ def download(fid, kind, outdir=PHOTO_DIR, date=None):
     # it, and 30 minutes is the ceiling for one file - beyond that the link is
     # not worth waiting on and the next pass will try again.
     data = api(f"/file/{fid}/{kind}", timeout=300, raw=True,
-               max_bytes=None, deadline=1800)
+               max_bytes=None, deadline=1800, stall=60)
     tmp = path + ".part"
     with open(tmp, "wb") as f:
         f.write(data)
@@ -987,6 +995,17 @@ def cmd_get(fid, kind):
         ka.stop()
 
 
+class LinkLost(RuntimeError):
+    """The camera's hotspot has gone away mid-sync."""
+
+
+def _link_alive(ka):
+    # Six missed keep-alive pokes (~30s) is the same threshold cmd_session uses
+    # to decide the camera has slept; and no camera-subnet address at all
+    # means the hotspot is simply gone.
+    return ka.failures <= 6 and on_any_camera_wifi()
+
+
 def _sync_one(it, outdir):
     """Download one listing entry. Returns (fetched, message-or-None)."""
     kind = "MP4" if it.get("type") == 2 else "JPG"
@@ -1037,8 +1056,10 @@ def _sync_camera(outdir, jobs):
             used, total = int(st.get("used", 0)), int(st.get("total", 0)) or 1
             pct = 100 * used / total
             free_mb = (total - used) / 1024
+            pw = api("/cmd/info/2", timeout=10).get("data", {})
             print(f"SD card: {pct:.0f}% used, {free_mb:.0f} MB free, "
-                  f"{st.get('video', '?')} videos")
+                  f"{st.get('video', '?')} videos | battery {pw.get('voltage', '?')}%"
+                  + (" (external power)" if pw.get("ext_power") else ""))
             if pct >= 90:
                 print("  WARNING: the card is nearly full; the camera stops "
                       "recording when it fills. Every clip synced from it is "
@@ -1058,7 +1079,7 @@ def _sync_camera(outdir, jobs):
         total_mb = sum(i.get("size", 0) for i in items) / 1048576
         print(f"camera reports {len(items)} new of {listed} file(s), "
               f"{total_mb:.1f} MB; syncing to {outdir} with {jobs} worker(s)")
-        new, failed = 0, []
+        new, failed, lost = 0, [], False
         with ThreadPoolExecutor(max_workers=max(1, jobs)) as pool:
             futs = {pool.submit(_sync_one, it, outdir): it for it in items}
             for fut in as_completed(futs):
@@ -1068,13 +1089,29 @@ def _sync_camera(outdir, jobs):
                 except Exception as e:
                     print(f"  ! file {it['id']} failed: {e} (will retry)")
                     failed.append(it)
+                    # One dead-link timeout is enough evidence: once the
+                    # hotspot is gone every remaining request will sit out its
+                    # full timeout too. Stop waiting on them.
+                    if not _link_alive(ka):
+                        lost = True
+                        print("  camera link lost; abandoning the remaining "
+                              f"{len(futs) - new - len(failed)} download(s) "
+                              "until the next pass")
+                        for f in futs:
+                            f.cancel()
+                        break
                     continue
                 if fetched:
                     new += 1
                     print(msg)
         # Whatever failed under concurrency gets one calm serial retry: if
         # the firmware chokes on parallel connections, this is the fallback.
-        for it in failed:
+        # Not when the link itself is gone - each retry would only wait out
+        # another connect timeout against a hotspot that is not there.
+        for it in ([] if lost else failed):
+            if not _link_alive(ka):
+                print("  camera link lost; skipping the remaining retries")
+                break
             try:
                 fetched, msg = _sync_one(it, outdir)
                 if fetched:
