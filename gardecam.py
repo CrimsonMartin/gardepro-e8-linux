@@ -452,19 +452,26 @@ def disconnect():
 
 # ---------------------------------------------------------------- HTTP API
 
-def api(path, timeout=15, raw=False, max_bytes=4 * 1024 * 1024):
-    """GET from the camera, with a wall-clock deadline and a size cap.
+def api(path, timeout=15, raw=False, max_bytes=4 * 1024 * 1024, deadline=None):
+    """GET from the camera, bounded by wall clock and by size.
 
     urlopen's timeout is per socket operation, so a response that keeps
     trickling bytes never trips it: a camera once streamed a file listing at
     9 KB/s for over twenty minutes - megabytes, for a listing that should be
     tens of KB - and the whole pass sat on that one read while a second
-    camera's clips waited unscanned. `timeout` now bounds the entire request,
-    and a JSON response past `max_bytes` is treated as the firmware fault it
-    is. Either raises, and the caller already treats that as a failed camera.
+    camera's clips waited unscanned.
+
+    `timeout` is the per-operation wait (connect, and each read); `deadline`
+    bounds the whole request and defaults to `timeout`, which is right for
+    listings and commands. File transfers pass their own: a clip is ~10 MB,
+    and with several workers queued on the camera's single-threaded server one
+    file can legitimately take many minutes, so download() lifts the size cap
+    and gives a generous ceiling while still failing a link that has stalled
+    outright. Either limit raises, and the callers treat a raise as that
+    request failing, not the whole pass.
     """
     url = BASE + path
-    deadline = time.time() + timeout
+    deadline = time.time() + (timeout if deadline is None else deadline)
     chunks, size = [], 0
     with urllib.request.urlopen(url, timeout=timeout) as r:
         while True:
@@ -479,7 +486,7 @@ def api(path, timeout=15, raw=False, max_bytes=4 * 1024 * 1024):
                 break
             chunks.append(chunk)
             size += len(chunk)
-            if size > max_bytes:
+            if max_bytes is not None and size > max_bytes:
                 raise ValueError(f"{path}: response exceeded {max_bytes} bytes; "
                                  "the camera is streaming garbage")
     data = b"".join(chunks)
@@ -807,7 +814,11 @@ def download(fid, kind, outdir=PHOTO_DIR, date=None):
     path = os.path.join(outdir, f"cam{CAM_INDEX}_{name}")
     if os.path.exists(path) and os.path.getsize(path) > 0:
         return path, False
-    data = api(f"/file/{fid}/{kind}", timeout=300, raw=True)
+    # A clip, not a listing: no size cap, a stall of 300s between reads fails
+    # it, and 30 minutes is the ceiling for one file - beyond that the link is
+    # not worth waiting on and the next pass will try again.
+    data = api(f"/file/{fid}/{kind}", timeout=300, raw=True,
+               max_bytes=None, deadline=1800)
     tmp = path + ".part"
     with open(tmp, "wb") as f:
         f.write(data)
