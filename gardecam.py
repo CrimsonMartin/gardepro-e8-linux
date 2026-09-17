@@ -115,6 +115,12 @@ PHOTO_DIR = os.environ.get("GARDECAM_MEDIA", os.path.join(HERE, "media"))
 # Raw clips are the bulk of the archive and grow about a gigabyte a day on a
 # busy camera, so sync drops the ones older than this. 0 keeps everything.
 KEEP_DAYS = int(os.environ.get("GARDECAM_KEEP_DAYS", "14") or 0)
+# After each sync, delete clips from the camera's SD card that are provably
+# already ours, leaving the newest PURGE_KEEP on the card. A full card stops
+# the camera recording while it still answers every request. 0 = never
+# (the default; the card is the camera owner's), PURGE_MAX bounds one pass.
+PURGE_KEEP = int(os.environ.get("GARDECAM_PURGE_KEEP", "0") or 0)
+PURGE_MAX = int(os.environ.get("GARDECAM_PURGE_MAX", "300") or 300)
 
 
 def require_mac():
@@ -1047,6 +1053,19 @@ def cmd_sync(outdir=PHOTO_DIR, jobs=4):
                          + ", ".join(failed))
 
 
+def _purge_after_sync(ka, outdir, lost=False):
+    """Clear the card of what earlier passes secured, if enabled and the link
+    is still up. Runs whether or not this pass downloaded anything - a camera
+    with a full card reports every clip as already synced, which is exactly
+    the pass that must purge."""
+    if PURGE_KEEP <= 0 or lost or not _link_alive(ka):
+        return
+    try:
+        purge_synced(outdir, keep=PURGE_KEEP, limit=PURGE_MAX, apply=True)
+    except Exception as e:
+        print(f"  (card purge skipped: {e})")
+
+
 def _sync_camera(outdir, jobs):
     from concurrent.futures import ThreadPoolExecutor, as_completed
     ka = link_up()
@@ -1070,6 +1089,7 @@ def _sync_camera(outdir, jobs):
         if not items:
             if listed:
                 print(f"camera reports {listed} file(s), all already synced")
+                _purge_after_sync(ka, outdir)
             else:
                 print("no files reported by camera; raw response:")
                 print(json.dumps(list_files(50), indent=2)[:2000])
@@ -1120,6 +1140,7 @@ def _sync_camera(outdir, jobs):
             except Exception as e:
                 print(f"  ! file {it['id']} failed again: {e}")
         print(f"done, {new} new file(s) in {outdir}")
+        _purge_after_sync(ka, outdir, lost=lost)
     finally:
         ka.stop()
         # Drop the camera hotspot straight away rather than waiting for the
@@ -1147,61 +1168,72 @@ def cmd_session(seconds=300):
     print("session ended")
 
 
-def cmd_purge(keep=100, limit=None, apply=False, outdir=PHOTO_DIR):
-    """Free the SD card by deleting clips that are already synced.
+def purge_synced(outdir, keep=100, limit=None, apply=False):
+    """Delete clips from the card that are provably already ours.
 
-    A full card silently stops the camera recording while it still answers
-    every request, which is how one camera sat blind for twelve hours. A clip
-    is eligible only if its id is in the sync ledger (it was downloaded) and
-    its sidecar is on disk (it was scanned and pushed to the remote host), so
-    nothing leaves the card that does not exist elsewhere. The newest `keep`
-    files are left alone as a buffer. Dry run unless --apply is given; --limit
-    caps how many are removed in one go for a cautious first pass.
+    Assumes the camera link is up. A clip is eligible only if its id is in the
+    sync ledger (it was downloaded) and its sidecar is on disk (it was scanned
+    and pushed to the remote host; the sidecar is pulled back afterwards), so
+    nothing leaves the card that does not exist elsewhere - and because the
+    sidecar only appears a pass after the download, a clip is never deleted
+    in the same pass that fetched it. The newest `keep` files stay as a
+    buffer. Returns (eligible, deleted, failed).
+    """
+    known = _read_ledger(outdir)
+    items = [it for it in list_all_files()
+             if isinstance(it, dict) and isinstance(it.get("id"), int)]
+    items.sort(key=lambda it: it["id"], reverse=True)  # newest first
+    candidates = []
+    for it in items[keep:]:
+        key = _key(it)
+        kind = "MP4" if it.get("type") == 2 else "JPG"
+        stem = f"cam{CAM_INDEX}_{key}.{kind.lower()}"
+        scanned = os.path.exists(os.path.join(outdir, stem + ".wildlife.json"))
+        if key in known and scanned:
+            candidates.append((it["id"], kind, it.get("size", 0)))
+    if limit:
+        candidates = candidates[-limit:]  # oldest first when capped
+    total_mb = sum(s for _, _, s in candidates) / 1048576
+    print(f"card holds {len(items)} file(s); keeping newest {keep}; "
+          f"{len(candidates)} provably synced+scanned -> {total_mb:.0f} MB")
+    if not apply:
+        return len(candidates), 0, 0
+    done = failed = 0
+    for fid, kind, _ in sorted(candidates):
+        try:
+            r = api(f"/cmd/delete/{fid}/{kind}", timeout=15)
+            ok = isinstance(r, dict) and r.get("code") == 0
+        except Exception as e:
+            ok, r = False, e
+        if ok:
+            done += 1
+        else:
+            failed += 1
+            print(f"  ! delete {fid} {kind} failed: {r}")
+            if failed >= 5:
+                print("  too many delete failures; stopping")
+                break
+    print(f"deleted {done} file(s) from the card ({failed} failed)")
+    try:
+        st = api("/cmd/info/3", timeout=10).get("data", {})
+        print(f"SD card now: {100*int(st.get('used',0))/(int(st.get('total',0)) or 1):.0f}% used")
+    except Exception:
+        pass
+    return len(candidates), done, failed
+
+
+def cmd_purge(keep=100, limit=None, apply=False, outdir=PHOTO_DIR):
+    """Free the SD card by hand: `purge [--apply] [--keep N] [--limit N]`.
+
+    Dry run unless --apply. The sync does this on its own every pass when
+    GARDECAM_PURGE_KEEP is set; this is for a one-off or a first big clear.
     """
     require_mac()
-    known = _read_ledger(outdir)
     ka = link_up()
     try:
-        items = [it for it in list_all_files()
-                 if isinstance(it, dict) and isinstance(it.get("id"), int)]
-        items.sort(key=lambda it: it["id"], reverse=True)  # newest first
-        candidates = []
-        for it in items[keep:]:
-            key = _key(it)
-            kind = "MP4" if it.get("type") == 2 else "JPG"
-            stem = f"cam{CAM_INDEX}_{key}.{kind.lower()}"
-            scanned = os.path.exists(os.path.join(outdir, stem + ".wildlife.json"))
-            if key in known and scanned:
-                candidates.append((it["id"], kind, it.get("size", 0)))
-        if limit:
-            candidates = candidates[-limit:]  # oldest first when capped
-        total_mb = sum(s for _, _, s in candidates) / 1048576
-        print(f"camera holds {len(items)} file(s); keeping newest {keep}; "
-              f"{len(candidates)} provably synced+scanned -> {total_mb:.0f} MB")
+        purge_synced(outdir, keep=keep, limit=limit, apply=apply)
         if not apply:
             print("dry run: nothing deleted. Re-run with --apply to delete.")
-            return
-        done = failed = 0
-        for fid, kind, _ in sorted(candidates):
-            try:
-                r = api(f"/cmd/delete/{fid}/{kind}", timeout=15)
-                ok = isinstance(r, dict) and r.get("code") == 0
-            except Exception as e:
-                ok, r = False, e
-            if ok:
-                done += 1
-            else:
-                failed += 1
-                print(f"  ! delete {fid} {kind} failed: {r}")
-                if failed >= 5:
-                    print("  too many failures; stopping")
-                    break
-        print(f"deleted {done} file(s) from the card ({failed} failed)")
-        try:
-            st = api("/cmd/info/3", timeout=10).get("data", {})
-            print(f"SD card now: {100*int(st.get('used',0))/(int(st.get('total',0)) or 1):.0f}% used")
-        except Exception:
-            pass
     finally:
         ka.stop()
         disconnect()
