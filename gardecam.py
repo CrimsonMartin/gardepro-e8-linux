@@ -1187,8 +1187,12 @@ def purge_synced(outdir, keep=100, limit=None, apply=False):
     for it in items[keep:]:
         key = _key(it)
         kind = "MP4" if it.get("type") == 2 else "JPG"
-        stem = f"cam{CAM_INDEX}_{key}.{kind.lower()}"
-        scanned = os.path.exists(os.path.join(outdir, stem + ".wildlife.json"))
+        # Clips synced before cameras were numbered carry no cam<N>_ prefix,
+        # and download() honours that; the sidecar check must too, or every
+        # early clip stays on the card forever as "unproven".
+        name = f"{key}.{kind.lower()}.wildlife.json"
+        scanned = any(os.path.exists(os.path.join(outdir, n))
+                      for n in (f"cam{CAM_INDEX}_{name}", name))
         if key in known and scanned:
             candidates.append((it["id"], kind, it.get("size", 0)))
     if limit:
