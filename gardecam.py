@@ -22,6 +22,9 @@ Usage:
   gardecam.py session [SECONDS]    hold the link open (default 300)
   gardecam.py disconnect           drop camera wifi, return to normal network
   gardecam.py scan [SECONDS]       list nearby BLE devices (find your camera)
+  gardecam.py purge [--apply] [--keep N] [--limit N]
+                                   free the SD card of clips already synced
+                                   (dry run unless --apply)
 
 Platforms:
   Linux drives wifi through NetworkManager (nmcli) and addresses the camera
@@ -1029,6 +1032,19 @@ def _sync_camera(outdir, jobs):
     from concurrent.futures import ThreadPoolExecutor, as_completed
     ka = link_up()
     try:
+        try:
+            st = api("/cmd/info/3", timeout=10).get("data", {})
+            used, total = int(st.get("used", 0)), int(st.get("total", 0)) or 1
+            pct = 100 * used / total
+            free_mb = (total - used) / 1024
+            print(f"SD card: {pct:.0f}% used, {free_mb:.0f} MB free, "
+                  f"{st.get('video', '?')} videos")
+            if pct >= 90:
+                print("  WARNING: the card is nearly full; the camera stops "
+                      "recording when it fills. Every clip synced from it is "
+                      "safe to remove with `gardecam.py purge`.")
+        except Exception as e:
+            print(f"  (storage query failed: {e})")
         items, listed = list_new_files(outdir)
         if not items:
             if listed:
@@ -1094,6 +1110,66 @@ def cmd_session(seconds=300):
     print("session ended")
 
 
+def cmd_purge(keep=100, limit=None, apply=False, outdir=PHOTO_DIR):
+    """Free the SD card by deleting clips that are already synced.
+
+    A full card silently stops the camera recording while it still answers
+    every request, which is how one camera sat blind for twelve hours. A clip
+    is eligible only if its id is in the sync ledger (it was downloaded) and
+    its sidecar is on disk (it was scanned and pushed to the remote host), so
+    nothing leaves the card that does not exist elsewhere. The newest `keep`
+    files are left alone as a buffer. Dry run unless --apply is given; --limit
+    caps how many are removed in one go for a cautious first pass.
+    """
+    require_mac()
+    known = _read_ledger(outdir)
+    ka = link_up()
+    try:
+        items = [it for it in list_all_files()
+                 if isinstance(it, dict) and isinstance(it.get("id"), int)]
+        items.sort(key=lambda it: it["id"], reverse=True)  # newest first
+        candidates = []
+        for it in items[keep:]:
+            key = _key(it)
+            kind = "MP4" if it.get("type") == 2 else "JPG"
+            stem = f"cam{CAM_INDEX}_{key}.{kind.lower()}"
+            scanned = os.path.exists(os.path.join(outdir, stem + ".wildlife.json"))
+            if key in known and scanned:
+                candidates.append((it["id"], kind, it.get("size", 0)))
+        if limit:
+            candidates = candidates[-limit:]  # oldest first when capped
+        total_mb = sum(s for _, _, s in candidates) / 1048576
+        print(f"camera holds {len(items)} file(s); keeping newest {keep}; "
+              f"{len(candidates)} provably synced+scanned -> {total_mb:.0f} MB")
+        if not apply:
+            print("dry run: nothing deleted. Re-run with --apply to delete.")
+            return
+        done = failed = 0
+        for fid, kind, _ in sorted(candidates):
+            try:
+                r = api(f"/cmd/delete/{fid}/{kind}", timeout=15)
+                ok = isinstance(r, dict) and r.get("code") == 0
+            except Exception as e:
+                ok, r = False, e
+            if ok:
+                done += 1
+            else:
+                failed += 1
+                print(f"  ! delete {fid} {kind} failed: {r}")
+                if failed >= 5:
+                    print("  too many failures; stopping")
+                    break
+        print(f"deleted {done} file(s) from the card ({failed} failed)")
+        try:
+            st = api("/cmd/info/3", timeout=10).get("data", {})
+            print(f"SD card now: {100*int(st.get('used',0))/(int(st.get('total',0)) or 1):.0f}% used")
+        except Exception:
+            pass
+    finally:
+        ka.stop()
+        disconnect()
+
+
 def cmd_scan(seconds=20):
     """List nearby BLE devices so the camera can be identified.
 
@@ -1142,6 +1218,13 @@ def main():
         disconnect()
     elif cmd == "scan":
         cmd_scan(int(args[1]) if len(args) > 1 else 20)
+    elif cmd == "purge":
+        # purge [--apply] [--keep N] [--limit N]
+        opts = args[1:]
+        def opt(name, default):
+            return int(opts[opts.index(name) + 1]) if name in opts else default
+        cmd_purge(keep=opt("--keep", 100), limit=opt("--limit", None),
+                  apply="--apply" in opts)
     else:
         print(__doc__)
 
