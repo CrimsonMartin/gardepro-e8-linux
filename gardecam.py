@@ -452,10 +452,37 @@ def disconnect():
 
 # ---------------------------------------------------------------- HTTP API
 
-def api(path, timeout=15, raw=False):
+def api(path, timeout=15, raw=False, max_bytes=4 * 1024 * 1024):
+    """GET from the camera, with a wall-clock deadline and a size cap.
+
+    urlopen's timeout is per socket operation, so a response that keeps
+    trickling bytes never trips it: a camera once streamed a file listing at
+    9 KB/s for over twenty minutes - megabytes, for a listing that should be
+    tens of KB - and the whole pass sat on that one read while a second
+    camera's clips waited unscanned. `timeout` now bounds the entire request,
+    and a JSON response past `max_bytes` is treated as the firmware fault it
+    is. Either raises, and the caller already treats that as a failed camera.
+    """
     url = BASE + path
+    deadline = time.time() + timeout
+    chunks, size = [], 0
     with urllib.request.urlopen(url, timeout=timeout) as r:
-        data = r.read()
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                raise TimeoutError(f"{path}: no complete response within {timeout}s "
+                                   f"({size} bytes so far)")
+            # Cap each socket wait by what is left of the overall budget.
+            r.fp.raw._sock.settimeout(max(0.5, min(remaining, timeout))) if hasattr(r.fp, "raw") and hasattr(r.fp.raw, "_sock") and r.fp.raw._sock else None
+            chunk = r.read(65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+            if size > max_bytes:
+                raise ValueError(f"{path}: response exceeded {max_bytes} bytes; "
+                                 "the camera is streaming garbage")
+    data = b"".join(chunks)
     if raw:
         return data
     try:
