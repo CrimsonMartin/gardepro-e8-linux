@@ -43,6 +43,7 @@ import subprocess
 import sys
 import time
 import urllib.request
+import urllib.error
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -164,18 +165,43 @@ def notify(title, message, attachment=None, priority=None, tags=None,
     body = message.encode("utf-8")
     if attachment and os.path.exists(attachment):
         # With a file body the text goes in the Message header instead.
-        headers["Filename"] = os.path.basename(attachment)
-        headers["Message"] = message.encode("utf-8").decode("latin-1", "replace")
+        with_file = dict(headers)
+        with_file["Filename"] = os.path.basename(attachment)
+        with_file["Message"] = message.encode("utf-8").decode("latin-1", "replace")
         with open(attachment, "rb") as f:
-            body = f.read()
+            file_body = f.read()
+        err = _publish(with_file, file_body)
+        if err is None:
+            return True
+        # ntfy caps how much attachment data one sender may have stored (100 MB
+        # by default, and with a 30-day attachment expiry that cap fills up and
+        # never drains). It answers 413 and drops the connection mid-upload,
+        # which surfaces here as HTTPError 413 or a broken pipe. The image is
+        # decoration; the alert is not. Send the words on their own.
+        log(f"ntfy refused the attachment ({err}); sending text only")
+    err = _publish(headers, body)
+    if err is None:
+        return True
+    log(f"ntfy failed: {err}")  # never let a failed push kill the pass
+    return False
+
+
+def _publish(headers, body):
+    """One PUT to the topic. None on success, else a short error string."""
     req = urllib.request.Request(NTFY, data=body, headers=headers, method="PUT")
     try:
         with urllib.request.urlopen(req, timeout=30) as r:
             r.read()
-        return True
-    except Exception as e:  # never let a failed push kill the pass
-        log(f"ntfy failed: {e}")
-        return False
+        return None
+    except urllib.error.HTTPError as e:
+        detail = ""
+        try:
+            detail = e.read(300).decode("utf-8", "replace").strip()
+        except Exception:
+            pass
+        return f"HTTP {e.code} {detail}".strip()
+    except Exception as e:
+        return str(e)
 
 
 def clip_when(name):
