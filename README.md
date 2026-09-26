@@ -137,17 +137,8 @@ to its advertised name:
 python3 gardecam.py scan          # list BLE devices; the camera shows as CAM...
 ```
 
-That is enough for one camera. With several listed, the Mac cannot tell them
-apart before waking one - the advertised names are identical - so `sync` wakes
-whatever it finds, reads the camera's MAC off the hotspot name that comes up,
-and remembers which UUID that was in `.gardecam-ble-uuids.json`. After the
-first encounter each camera is addressed directly. `GARDECAM_BLE_UUID` still
-pins one by hand if you want it.
-
-Because of that, every machine can hold the same `GARDECAM_BLE_MAC` list: a
-pass scans for the cameras within Bluetooth range and visits only those, so
-moving a camera from one laptop to another needs no config change and the
-clip prefixes (`cam1_`, `cam2_`, ...) stay with the camera.
+That is enough for one camera. With several in range, pin each Mac-local UUID
+from `scan` in `GARDECAM_BLE_UUID`, since the names are identical.
 
 **Wifi goes through `networksetup`, not NetworkManager.** macOS remembers every
 network it joins and would rank the camera above your real one, so the camera
