@@ -120,6 +120,11 @@ AIRPORT = ("/System/Library/PrivateFrameworks/Apple80211.framework"
 # host, so BLE_MAC cannot address the camera on macOS. Pin the UUID here
 # (see `gardecam.py scan`) or leave it unset to match on advertised name.
 BLE_UUID = os.environ.get("GARDECAM_BLE_UUID", "").strip()
+# Set while syncing a particular camera on macOS, where the MAC cannot address
+# it. Learned once per camera (see _identify_camera) and remembered here.
+BLE_TARGET_UUID = None
+UUID_CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          ".gardecam-ble-uuids.json")
 BLE_NAME = os.environ.get("GARDECAM_BLE_NAME", "CAM").strip()
 PHOTO_DIR = os.environ.get("GARDECAM_MEDIA", os.path.join(HERE, "media"))
 # Raw clips are the bulk of the archive and grow about a gigabyte a day on a
@@ -174,6 +179,9 @@ async def find_camera(BleakScanner, timeout=20):
     """
     if not IS_MAC:
         return await BleakScanner.find_device_by_address(BLE_MAC, timeout=timeout)
+    if BLE_TARGET_UUID:
+        return await BleakScanner.find_device_by_address(BLE_TARGET_UUID,
+                                                         timeout=timeout)
     if BLE_UUID:
         return await BleakScanner.find_device_by_address(BLE_UUID, timeout=timeout)
     for d in await BleakScanner.discover(timeout=timeout):
@@ -328,6 +336,97 @@ def _pick_radio():
               + ("" if ok else f" (none reach {MIN_SIGNAL}%)"))
     IFACE = iface
     return str(sig)
+
+
+def visible_cameras():
+    """MACs from CAMERAS whose hotspot is on the air right now."""
+    names = {"CAM8Z8_" + m.replace(":", ""): m for m in CAMERAS}
+    if IS_MAC:
+        lines = [l.strip() for l in sh(f"{AIRPORT} -s", timeout=40).stdout.splitlines()]
+        return [mac for ssid, mac in names.items()
+                if any(l.startswith(ssid + " ") for l in lines)]
+    out = sh(f"nmcli -t -f SSID device wifi list ifname {IFACE}", timeout=30).stdout
+    up = {l.strip() for l in out.splitlines()}
+    return [mac for ssid, mac in names.items() if ssid in up]
+
+
+def discover_cameras(timeout=20, sweeps=2):
+    """Cameras within Bluetooth range: {address: name}, or None if the scan
+    itself failed.
+
+    Addresses are MACs on Linux and CoreBluetooth UUIDs on macOS. One sweep
+    misses a camera often - it advertises in bursts to save its battery - so
+    sweep twice before concluding one is out of range. Knowing which cameras
+    are actually here is what keeps a machine that lists all of them from
+    spending minutes each pass waking cameras that are miles away.
+    """
+    from bleak import BleakScanner
+
+    seen = {}
+    for i in range(max(1, sweeps)):
+        try:
+            found = asyncio.run(BleakScanner.discover(timeout=timeout))
+        except Exception as e:
+            print(f"  BLE scan failed: {e}")
+            return None
+        for d in found:
+            addr = (d.address or "").upper()
+            if IS_MAC:
+                if (d.name or "").upper().startswith(BLE_NAME.upper()):
+                    seen[d.address] = d.name or "?"
+            elif addr in CAMERAS:
+                seen[addr] = d.name or "?"
+        if not IS_MAC and len(seen) >= len(CAMERAS):
+            break
+    return seen
+
+
+def _load_uuid_map():
+    """macOS: {MAC: CoreBluetooth UUID} learned on this machine."""
+    try:
+        with open(UUID_CACHE) as f:
+            return {k.upper(): v for k, v in json.load(f).items()}
+    except Exception:
+        return {}
+
+
+def _save_uuid_map(m):
+    try:
+        with open(UUID_CACHE, "w") as f:
+            json.dump(m, f, indent=1, sort_keys=True)
+    except Exception as e:
+        print(f"  (could not save the BLE UUID map: {e})")
+
+
+def _identify_camera(uuid, wait=50):
+    """Wake the BLE device `uuid` and report which configured camera it is.
+
+    CoreBluetooth never exposes a peripheral's MAC, so a Mac with two cameras
+    in range cannot ask for one of them by name - the advertised names are
+    identical. It can find out afterwards: the hotspot that comes up is named
+    after the camera's own MAC. Only a hotspot that was not already on the air
+    counts, so a neighbouring camera still shutting down is not mistaken for
+    this one.
+    """
+    global BLE_TARGET_UUID
+    before = set(visible_cameras())
+    BLE_TARGET_UUID = uuid
+    waker = BleWaker()
+    waker.start()
+    waker.ready.wait(timeout=45)
+    try:
+        if waker.error:
+            print(f"  BLE {uuid}: wake failed: {waker.error}")
+            return None
+        deadline = time.time() + wait
+        while time.time() < deadline:
+            new = set(visible_cameras()) - before
+            if new:
+                return sorted(new)[0]
+            time.sleep(3)
+    finally:
+        waker.stop()
+    return None
 
 
 def current_ssid():
@@ -1075,18 +1174,36 @@ def _sync_one(it, outdir):
                   f"({it.get('size',0)/1048576:.1f} MB{note})")
 
 
+def _label(mac):
+    return f"camera {CAMERAS.index(mac) + 1}/{len(CAMERAS)}: {mac}"
+
+
 def cmd_sync(outdir=PHOTO_DIR, jobs=4):
     """Sync every configured camera into outdir, one after another.
 
-    A camera that is out of range (or never wakes) is reported and skipped so
-    the rest still get synced; the exit status is non-zero if any failed.
+    Every machine may list every camera: a pass first asks Bluetooth which of
+    them are actually within range and visits only those, so the same .env
+    works wherever a camera is moved to. A camera that is in range but never
+    wakes is reported and skipped so the rest still get synced, and the exit
+    status is non-zero only for those - one that is simply somewhere else is
+    not a failure.
     """
     require_mac()
+    if IS_MAC and len(CAMERAS) > 1:
+        return _sync_by_discovery(outdir, jobs)
+    order, absent = CAMERAS, []
+    if len(CAMERAS) > 1:
+        seen = discover_cameras()
+        # Nothing seen at all means the scan, not the cameras, is the problem:
+        # fall through and try them all rather than skipping the whole pass.
+        if seen:
+            order = [m for m in CAMERAS if m in seen]
+            absent = [m for m in CAMERAS if m not in seen]
     failed = []
-    for i, mac in enumerate(CAMERAS, 1):
+    for mac in order:
         select_camera(mac)
         if len(CAMERAS) > 1:
-            print(f"--- camera {i}/{len(CAMERAS)}: {mac}")
+            print(f"--- {_label(mac)}")
         try:
             _sync_camera(outdir, jobs)
         except SystemExit as e:
@@ -1095,8 +1212,63 @@ def cmd_sync(outdir=PHOTO_DIR, jobs=4):
         except Exception as e:
             print(f"camera {mac}: sync failed: {e}")
             failed.append(mac)
+    for mac in absent:
+        print(f"--- {_label(mac)} not in Bluetooth range this pass")
     # After the cameras, not per-camera: one pass over the directory, and it
     # still runs when a camera was unreachable.
+    prune_old(outdir)
+    if failed:
+        raise SystemExit(f"{len(failed)} of {len(CAMERAS)} camera(s) failed: "
+                         + ", ".join(failed))
+
+
+def _sync_by_discovery(outdir, jobs):
+    """macOS with several cameras listed: work out which ones are here.
+
+    CoreBluetooth hides the MAC behind a per-host UUID, so this Mac cannot ask
+    for one camera by name while another is in range - their advertised names
+    are identical, and targeting the wrong one wastes a pass. Instead it wakes
+    what it finds, reads the camera's MAC off the hotspot name, and remembers
+    the pairing; from the second encounter on, each camera is addressed
+    directly by its UUID.
+    """
+    global BLE_TARGET_UUID
+    uuid_of = _load_uuid_map()
+    mac_of = {v: k for k, v in uuid_of.items()}
+    seen = discover_cameras() or {}
+    failed, done = [], []
+    try:
+        for uuid in list(seen):
+            mac = mac_of.get(uuid)
+            if mac is not None and (mac not in CAMERAS or mac in done):
+                continue
+            if mac is None:
+                mac = _identify_camera(uuid)
+                if mac is None:
+                    print(f"  BLE {uuid}: not one of the configured cameras")
+                    continue
+                uuid_of[mac], mac_of[uuid] = uuid, mac
+                _save_uuid_map(uuid_of)
+                print(f"  BLE {uuid} is {_label(mac)}")
+                if mac in done:
+                    continue
+            BLE_TARGET_UUID = uuid
+            select_camera(mac)
+            print(f"--- {_label(mac)}")
+            try:
+                _sync_camera(outdir, jobs)
+                done.append(mac)
+            except SystemExit as e:
+                print(f"camera {mac}: {e}")
+                failed.append(mac)
+            except Exception as e:
+                print(f"camera {mac}: sync failed: {e}")
+                failed.append(mac)
+    finally:
+        BLE_TARGET_UUID = None
+    for mac in CAMERAS:
+        if mac not in done and mac not in failed:
+            print(f"--- {_label(mac)} not in Bluetooth range this pass")
     prune_old(outdir)
     if failed:
         raise SystemExit(f"{len(failed)} of {len(CAMERAS)} camera(s) failed: "

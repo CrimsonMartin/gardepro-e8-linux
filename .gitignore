@@ -7,3 +7,4 @@ __pycache__/
 .venv/
 autosync.log*
 launchd.log
+.gardecam-ble-uuids.json
