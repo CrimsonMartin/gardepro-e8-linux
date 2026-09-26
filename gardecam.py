@@ -381,6 +381,39 @@ def discover_cameras(timeout=20, sweeps=2):
     return seen
 
 
+HOME_CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          ".gardecam-home-cameras.json")
+
+
+def _load_home():
+    """MACs this machine has synced before.
+
+    A camera advertises in bursts to save its battery, so a discovery sweep
+    misses one that is sitting right there often enough to matter: on the
+    first pass after the cameras were listed everywhere, a camera that had
+    synced 30 minutes earlier simply did not answer the sweep. A camera known
+    to live here is therefore still tried when the sweep does not see it,
+    just not as hard. One that has never synced here is genuinely somewhere
+    else and is skipped outright.
+    """
+    try:
+        with open(HOME_CACHE) as f:
+            return {m.upper() for m in json.load(f)}
+    except Exception:
+        return set()
+
+
+def _remember_home(mac):
+    home = _load_home()
+    if mac in home:
+        return
+    try:
+        with open(HOME_CACHE, "w") as f:
+            json.dump(sorted(home | {mac}), f, indent=1)
+    except Exception as e:
+        print(f"  (could not record this camera as local: {e})")
+
+
 def _load_uuid_map():
     """macOS: {MAC: CoreBluetooth UUID} learned on this machine."""
     try:
@@ -1191,21 +1224,25 @@ def cmd_sync(outdir=PHOTO_DIR, jobs=4):
     require_mac()
     if IS_MAC and len(CAMERAS) > 1:
         return _sync_by_discovery(outdir, jobs)
-    order, absent = CAMERAS, []
+    order, absent = [(m, 3) for m in CAMERAS], []
     if len(CAMERAS) > 1:
         seen = discover_cameras()
         # Nothing seen at all means the scan, not the cameras, is the problem:
         # fall through and try them all rather than skipping the whole pass.
         if seen:
-            order = [m for m in CAMERAS if m in seen]
-            absent = [m for m in CAMERAS if m not in seen]
+            home = _load_home()
+            order = ([(m, 3) for m in CAMERAS if m in seen]
+                     + [(m, 1) for m in CAMERAS if m not in seen and m in home])
+            absent = [m for m in CAMERAS if m not in seen and m not in home]
     failed = []
-    for mac in order:
+    for mac, retries in order:
         select_camera(mac)
         if len(CAMERAS) > 1:
-            print(f"--- {_label(mac)}")
+            print(f"--- {_label(mac)}"
+                  + ("" if retries > 1 else " (not advertising; one try)"))
         try:
-            _sync_camera(outdir, jobs)
+            _sync_camera(outdir, jobs, retries=retries)
+            _remember_home(mac)
         except SystemExit as e:
             print(f"camera {mac}: {e}")
             failed.append(mac)
@@ -1264,6 +1301,24 @@ def _sync_by_discovery(outdir, jobs):
             except Exception as e:
                 print(f"camera {mac}: sync failed: {e}")
                 failed.append(mac)
+        # Known to live here but silent this sweep: worth one try, not three.
+        for mac, uuid in sorted(uuid_of.items()):
+            if mac not in CAMERAS or mac in done or mac in failed:
+                continue
+            if uuid in seen:
+                continue
+            BLE_TARGET_UUID = uuid
+            select_camera(mac)
+            print(f"--- {_label(mac)} (not advertising; one try)")
+            try:
+                _sync_camera(outdir, jobs, retries=1)
+                done.append(mac)
+            except SystemExit as e:
+                print(f"camera {mac}: {e}")
+                failed.append(mac)
+            except Exception as e:
+                print(f"camera {mac}: sync failed: {e}")
+                failed.append(mac)
     finally:
         BLE_TARGET_UUID = None
     for mac in CAMERAS:
@@ -1288,9 +1343,9 @@ def _purge_after_sync(ka, outdir, lost=False):
         print(f"  (card purge skipped: {e})")
 
 
-def _sync_camera(outdir, jobs):
+def _sync_camera(outdir, jobs, retries=3):
     from concurrent.futures import ThreadPoolExecutor, as_completed
-    ka = link_up()
+    ka = link_up(retries=retries)
     try:
         try:
             st = api("/cmd/info/3", timeout=10).get("data", {})

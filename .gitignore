@@ -8,3 +8,4 @@ __pycache__/
 autosync.log*
 launchd.log
 .gardecam-ble-uuids.json
+.gardecam-home-cameras.json
