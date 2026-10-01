@@ -295,11 +295,14 @@ for name in cfg["files"]:
         best = {}   # label -> (score, frame path, detections)
         kf = {}     # sampled frame index -> (label, score, animal boxes)
         analyzed = 0
+        boxed = False  # did MegaDetector box an animal on any sampled frame?
         for p in preds.get("predictions", []):
             analyzed += 1
             pred = p.get("prediction") or ""
             score = float(p.get("prediction_score") or 0)
             label = label_of(pred)
+            if frame_boxes(p, "animal"):
+                boxed = True
             if is_video:
                 idx = int(Path(p.get("filepath", "f0")).stem[1:])
                 boxes = frame_boxes(p, "animal")
@@ -309,15 +312,6 @@ for name in cfg["files"]:
             if label in ("blank", "no cv result") or score < cfg["score"]:
                 continue
             if label in ("human", "vehicle") and not cfg.get("all"):
-                continue
-            # The classifier runs on the whole frame when the detector finds
-            # nothing, and on some empty scenes (the underside of a parked
-            # car) it still says "cat". Only count a species on a frame where
-            # MegaDetector actually boxed an animal - with no box there is
-            # nothing to draw either, so the clip would be labelled wildlife
-            # and rendered bare.
-            if (label not in ("human", "vehicle")
-                    and not frame_boxes(p, "animal")):
                 continue
             s = stats.setdefault(label, {"frames": 0, "max_score": 0.0,
                                          "prediction": pred})
@@ -331,7 +325,15 @@ for name in cfg["files"]:
         # A single hit in a whole video is usually noise; require two sampled
         # frames for videos, one for still photos.
         need = 2 if is_video else 1
-        present = sorted(l for l, s in stats.items() if s["frames"] >= need)
+        # The classifier runs on the whole frame when the detector finds
+        # nothing, and on some empty scenes (the underside of a parked car)
+        # it still says "cat" at 0.6-0.9. So a species only counts when
+        # MegaDetector boxed an animal somewhere in the clip - otherwise the
+        # clip is reported as wildlife and rendered with nothing drawn on it.
+        # Per clip rather than per frame: a real cat right at the lens is
+        # often named confidently on frames where its box is too weak to keep.
+        present = sorted(l for l, s in stats.items() if s["frames"] >= need
+                         and (boxed or l in ("human", "vehicle")))
 
         for label in present:
             score, fpath, dets = best[label]
