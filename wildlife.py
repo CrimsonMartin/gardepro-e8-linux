@@ -310,6 +310,15 @@ for name in cfg["files"]:
                 continue
             if label in ("human", "vehicle") and not cfg.get("all"):
                 continue
+            # The classifier runs on the whole frame when the detector finds
+            # nothing, and on some empty scenes (the underside of a parked
+            # car) it still says "cat". Only count a species on a frame where
+            # MegaDetector actually boxed an animal - with no box there is
+            # nothing to draw either, so the clip would be labelled wildlife
+            # and rendered bare.
+            if (label not in ("human", "vehicle")
+                    and not frame_boxes(p, "animal")):
+                continue
             s = stats.setdefault(label, {"frames": 0, "max_score": 0.0,
                                          "prediction": pred})
             s["frames"] += 1
